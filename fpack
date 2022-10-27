@@ -1,0 +1,7 @@
+#!/bin/bash
+
+IMAGE_NAME=cfitsio-omp-pack
+
+cd $(dirname $1)
+docker run -v ${PWD}:/data -w /data ${IMAGE_NAME} fpack -table -threads 4 $(basename $1)
+cd -
