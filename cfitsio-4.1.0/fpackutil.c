@@ -190,6 +190,7 @@ int fp_init (fpstate *fpptr)
 	fpptr->do_images = 1;  /* can be turned off with -tableonly switch */
 	fpptr->test_all = 0;
 	fpptr->verbose = 0;
+	fpptr->num_workers = 1;
 
 	fpptr->prefix[0] = 0;
 	fpptr->extname[0] = 0;
@@ -1502,7 +1503,7 @@ int fp_pack_hdu (fitsfile *infptr, fitsfile *outfptr, fpstate fpvar,
 		/* data is less than 1 FITS block in size, so don't compress */
 	        fits_copy_hdu (infptr, outfptr, 0, &stat);
 	    } else {
-		    fits_compress_table (infptr, outfptr, &stat);
+		    fits_compress_table (infptr, outfptr, fpvar.num_workers, &stat);
 	    }
 
 	    *status = stat;
@@ -1646,7 +1647,7 @@ int fp_unpack_hdu (fitsfile *infptr, fitsfile *outfptr, fpstate fpvar, int *stat
 	    
 	    if (*status == 0 && lval != 0) {
 	        /*  uncompress the table */
-	        fits_uncompress_table (infptr, outfptr, status);
+	        fits_uncompress_table (infptr, outfptr, fpvar.num_workers, status);
 	    } else {
 	        if (*status == KEY_NO_EXIST)  /* table is not compressed */
 		    *status = 0;
@@ -1968,7 +1969,7 @@ int fp_test_table (fitsfile *infptr, fitsfile *outfptr, fitsfile *outfptr2,
 	int stat = 0, hdutype, tstatus = 0;
         char fzalgor[FLEN_VALUE];
 	LONGLONG headstart, datastart, dataend;
-	float elapse, cpu;
+	float packelapse, packcpu, unpackelapse, unpackcpu;
 
 	if (*status) return(0);
 
@@ -1986,16 +1987,26 @@ int fp_test_table (fitsfile *infptr, fitsfile *outfptr, fitsfile *outfptr2,
 		return(0);
 	}
 
+ 	fits_set_compression_type (outfptr, fpvar.comptype, &stat);
  	marktime(&stat);
         stat= -999;  /* set special flag value */
-	fits_compress_table (infptr, outfptr,  &stat);
+	fits_compress_table (infptr, outfptr, fpvar.num_workers,  &stat);
 
 	/* get elapsped times */
-	gettime(&elapse, &cpu, &stat);
+	gettime(&packelapse, &packcpu, &stat);
+
+	marktime(&stat);
+
+ 	fits_uncompress_table (outfptr, outfptr2, fpvar.num_workers, &stat);
+
+		/* get elapsped times */
+	gettime(&unpackelapse, &unpackcpu, &stat);
 
 	fits_delete_hdu(outfptr, &hdutype, &stat);
+	fits_delete_hdu(outfptr2, &hdutype, &stat);
 
-	printf("\nElapsed time = %f, cpu = %f\n", elapse, cpu);
+	printf("\nCompression elapsed time = %f, cpu = %f\n", packelapse, packcpu);
+	printf("\nUnompression elapsed time = %f, cpu = %f\n", unpackelapse, unpackcpu);
 
 	fits_report_error (stderr, stat);
 

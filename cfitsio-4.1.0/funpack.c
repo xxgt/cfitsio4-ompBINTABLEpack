@@ -5,6 +5,7 @@
 
 #include "fitsio.h"
 #include "fpack.h"
+#include <omp.h>
 
 int main (int argc, char *argv[])
 {
@@ -43,7 +44,8 @@ int fu_get_param (int argc, char *argv[], fpstate *fpptr)
 	/* flags must come first and be separately specified
 	 */
 	for (iarg = 1; iarg < argc; iarg++) {
-	    if (argv[iarg][0] == '-' && strlen (argv[iarg]) == 2) {
+	    if (argv[iarg][0] == '-' && strlen (argv[iarg]) == 2 || 
+			!strncmp(argv[iarg], "-threads", 8)) {
 
 		if (argv[iarg][1] == 'F') {
 		    fpptr->clobber++;
@@ -97,6 +99,15 @@ int fu_get_param (int argc, char *argv[], fpstate *fpptr)
                         fpptr->outfile[SZ_STR-1]=0;
                     }
 
+		} else if (!strcmp(argv[iarg], "-threads")) {
+		    if (++iarg >= argc) {
+			fu_usage (); exit (-1);
+		    } else {
+			fpptr->num_workers = (int) atoi(argv[iarg]);
+			if (fpptr->num_workers == 0) {
+				fu_usage (); exit (-1);
+			}
+		    }
 		} else {
 		    fp_msg ("Error: unknown command line flag `");
 		    fp_msg (argv[iarg]); fp_msg ("'\n");
@@ -134,7 +145,7 @@ int fu_get_param (int argc, char *argv[], fpstate *fpptr)
 
 int fu_usage (void)
 {
-	fp_msg ("usage: funpack [-E <HDUlist>] [-P <pre>] [-O <name>] [-Z] -v <FITS>\n");
+	fp_msg ("usage: funpack [-E <HDUlist>] [-P <pre>] [-O <name>] [-threads <num>] [-Z] -v <FITS>\n");
         fp_msg ("more:   [-F] [-D] [-S] [-L] [-C] [-H] [-V] \n");
 	return(0);
 }
@@ -161,6 +172,7 @@ fp_msg (" -F          Overwrite input file by output file with same name.\n");
 fp_msg (" -D          Delete input file after writing output.\n");
 fp_msg (" -S          Output uncompressed file to STDOUT file stream.\n");
 fp_msg (" -L          List contents, files unchanged.\n");
+fp_msg (" -threads <num> Set the amount of threads.\n");
 
 fp_msg (" -C          Don't update FITS checksum keywords.\n");
 

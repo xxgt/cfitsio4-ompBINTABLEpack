@@ -6,6 +6,8 @@
 # include <time.h>
 # include "fitsio2.h"
 
+#include <omp.h>	/* to paralleling operate fpack and funpack */
+
 #define NULL_VALUE -2147483647 /* value used to represent undefined pixels */
 #define ZERO_VALUE -2147483646 /* value used to represent zero-valued pixels */
 
@@ -1322,7 +1324,7 @@ int imcomp_init_table(fitsfile *outfptr,
 	
 	    if ( (outfptr->Fptr)->request_quantize_method == 0) 
               (outfptr->Fptr)->request_quantize_method = SUBTRACTIVE_DITHER_1;
-            
+       
             /* HCompress must not use SUBTRACTIVE_DITHER_2. If user is requesting
                this, assign SUBTRACTIVE_DITHER_1 instead. */
             if ((outfptr->Fptr)->request_quantize_method == SUBTRACTIVE_DITHER_2
@@ -1330,7 +1332,7 @@ int imcomp_init_table(fitsfile *outfptr,
                  (outfptr->Fptr)->request_quantize_method = SUBTRACTIVE_DITHER_1;
                fprintf(stderr,"Warning: CFITSIO does not allow subtractive_dither_2 when using Hcompress algorithm.\nWill use subtractive_dither_1 instead.\n");
             }
-                 
+
 	    if ((outfptr->Fptr)->request_quantize_method == SUBTRACTIVE_DITHER_1) {
 	      ffpkys(outfptr, "ZQUANTIZ", "SUBTRACTIVE_DITHER_1", 
 	        "Pixel Quantization Algorithm", status);
@@ -8009,7 +8011,7 @@ static int imcomp_double2nan(double *indata,
 /* =-====================================================================== */
 
 /*--------------------------------------------------------------------------*/
-int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
+int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int num_worker, int *status)
 
 /*
   Compress the input FITS Binary Table.
@@ -8051,7 +8053,7 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 { 
     long maxchunksize = 10000000; /* default value for the size of each chunk of the table */
 
-    char *cm_buffer;  /* memory buffer for the transposed, Column-Major, chunk of the table */ 
+    char *cm_buffer, *cm_buffer_base;  /* memory buffer for the transposed, Column-Major, chunk of the table */ 
     LONGLONG cm_colstart[1000];  /* starting offset of each column in the cm_buffer */
     LONGLONG rm_repeat[1000];    /* repeat count of each column in the input row-major table */
     LONGLONG rm_colwidth[999];   /* width in bytes of each column in the input row-major table */
@@ -8063,7 +8065,7 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 
     float compressed_size, uncompressed_size, tot_compressed_size, tot_uncompressed_size;
     LONGLONG nrows, firstrow;
-    LONGLONG headstart, datastart, dataend, startbyte, jj, kk, naxis1;
+    LONGLONG headstart, datastart, dataend, startbyte, jj, kk, naxis1, datapos;
     LONGLONG vlalen, vlamemlen, vlastart, bytepos;
     long repeat, width, nchunks, rowspertile, lastrows;
     int ii, ll, ncols, hdutype, ltrue = 1, print_report = 0, tstatus;
@@ -8073,6 +8075,9 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     LONGLONG *descriptors, *outdescript, *vlamem;
     int *pdescriptors;
     size_t dlen, datasize, compmemlen;
+
+    /* avoid warning for unused variables */
+    (void) firstrow;
 
     /* ================================================================================== */
     /* perform initial sanity checks */
@@ -8128,7 +8133,9 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 	        return(*status);
 	    }
     }
-
+    else {
+        fits_get_compression_type (outfptr, &default_algor, status);
+    }
      /* just copy the HDU verbatim if the table has 0 columns or rows or if the table */
     /* is less than 5760 bytes (2 blocks) in size, or compression directive keyword = "NONE" */
     if (nrows < 1  || ncols < 1 || (dataend - datastart) < 5760  || default_algor == NOCOMPRESS) {
@@ -8150,9 +8157,12 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     nchunks = (long) ((nrows - 1) / rowspertile + 1);  /* total number of chunks */
     lastrows = (long) (nrows - ((nchunks - 1) * rowspertile)); /* number of rows in last chunk */
 
+    num_worker = (num_worker > nchunks) ? nchunks : num_worker;
+    omp_set_num_threads(num_worker);
+
     /* allocate space for the transposed, column-major chunk of the table */
-    cm_buffer = calloc((size_t) naxis1, (size_t) rowspertile);
-    if (!cm_buffer) {
+    cm_buffer_base = calloc((size_t) naxis1*num_worker, (size_t) rowspertile);
+    if (!cm_buffer_base) {
         ffpmsg("Could not allocate cm_buffer for transposed table");
         *status = MEMORY_ALLOCATION;
         return(*status);
@@ -8198,88 +8208,88 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     cm_colstart[0] = 0;
     for (ii = 0; ii < ncols; ii++) {  
 
- 	/* get the structural parameters of the original uncompressed column */
-	fits_make_keyn("TFORM", ii+1, keyname, status);
-	fits_read_key(outfptr, TSTRING, keyname, tform, comm, status);
-        fits_binary_tform(tform, coltype+ii, &repeat, &width, status); /* get the repeat count and the width */
+        /* get the structural parameters of the original uncompressed column */
+        fits_make_keyn("TFORM", ii+1, keyname, status);
+        fits_read_key(outfptr, TSTRING, keyname, tform, comm, status);
+            fits_binary_tform(tform, coltype+ii, &repeat, &width, status); /* get the repeat count and the width */
 
-	/* preserve the original TFORM value and comment string in a ZFORMn keyword */
-	fits_read_card(outfptr, keyname, card, status); 
-	card[0] = 'Z';
-	fits_write_record(outfptr, card, status);
- 
-        /* All columns in the compressed table will have a variable-length array type. */
-	fits_modify_key_str(outfptr, keyname, "1QB", "&", status);  /* Use 'Q' pointers (64-bit) */ 
+        /* preserve the original TFORM value and comment string in a ZFORMn keyword */
+        fits_read_card(outfptr, keyname, card, status); 
+        card[0] = 'Z';
+        fits_write_record(outfptr, card, status);
+    
+            /* All columns in the compressed table will have a variable-length array type. */
+        fits_modify_key_str(outfptr, keyname, "1QB", "&", status);  /* Use 'Q' pointers (64-bit) */ 
 
-	/* deal with special cases: bit, string, and variable length array columns */
-	if (coltype[ii] == TBIT) {
-	    repeat = (repeat + 7) / 8;  /* convert from bits to equivalent number of bytes */
-	} else if (coltype[ii] == TSTRING) {
-	    width = 1;  /* ignore the optional 'w' in 'rAw' format */
-	} else if (coltype[ii] < 0) {  /* pointer to variable length array */
-	    if (strchr(tform,'Q') ) {
-	        width = 16;  /* 'Q' descriptor has 64-bit pointers */
-	    } else {
-	        width = 8;  /* 'P' descriptor has 32-bit pointers */
- 	    }
-	    repeat = 1;
-	}
+        /* deal with special cases: bit, string, and variable length array columns */
+        if (coltype[ii] == TBIT) {
+            repeat = (repeat + 7) / 8;  /* convert from bits to equivalent number of bytes */
+        } else if (coltype[ii] == TSTRING) {
+            width = 1;  /* ignore the optional 'w' in 'rAw' format */
+        } else if (coltype[ii] < 0) {  /* pointer to variable length array */
+            if (strchr(tform,'Q') ) {
+                width = 16;  /* 'Q' descriptor has 64-bit pointers */
+            } else {
+                width = 8;  /* 'P' descriptor has 32-bit pointers */
+            }
+            repeat = 1;
+        }
 
-	rm_repeat[ii] = repeat;   
-	rm_colwidth[ii] = repeat * width; /* column width (in bytes)in the input table */
-	
-	/* starting offset of each field in the OUTPUT transposed column-major table */
-	cm_colstart[ii + 1] = cm_colstart[ii] + rm_colwidth[ii] * rowspertile;
-	/* total number of elements in each column of the transposed column-major table */
-	cm_repeat[ii] = rm_repeat[ii] * rowspertile;
+        rm_repeat[ii] = repeat;   
+        rm_colwidth[ii] = repeat * width; /* column width (in bytes)in the input table */
+        
+        /* starting offset of each field in the OUTPUT transposed column-major table */
+        cm_colstart[ii + 1] = cm_colstart[ii] + rm_colwidth[ii] * rowspertile;
+        /* total number of elements in each column of the transposed column-major table */
+        cm_repeat[ii] = rm_repeat[ii] * rowspertile;
 
-	compalgor[ii] = default_algor;  /* initialize the column compression algorithm to the default */
-	
-	/*  check if a compression method has been specified for this column */
-	fits_make_keyn("FZALG", ii+1, keyname, status);
-	tstatus = 0;
-	if (!fits_read_key(outfptr, TSTRING, keyname, tempstring, NULL, &tstatus)) {
+        compalgor[ii] = default_algor;  /* initialize the column compression algorithm to the default */
+        
+        /*  check if a compression method has been specified for this column */
+        fits_make_keyn("FZALG", ii+1, keyname, status);
+        tstatus = 0;
+        if (!fits_read_key(outfptr, TSTRING, keyname, tempstring, NULL, &tstatus)) {
 
-	    if (!fits_strcasecmp(tempstring, "GZIP") || !fits_strcasecmp(tempstring, "GZIP_1")) {
-	            compalgor[ii] = GZIP_1;
-	    } else if (!fits_strcasecmp(tempstring, "GZIP_2")) {
-	            compalgor[ii] = GZIP_2;
-	    } else if (!fits_strcasecmp(tempstring, "RICE_1")) {
-	            compalgor[ii] = RICE_1;
-	    } else {
-	        ffpmsg("Unsupported table compression algorithm specification.");
-		ffpmsg(keyname);
-		ffpmsg(tempstring);
-	        *status = DATA_COMPRESSION_ERR;
-		free(cm_buffer);
-	        return(*status);
-	    }
-	}
+            if (!fits_strcasecmp(tempstring, "GZIP") || !fits_strcasecmp(tempstring, "GZIP_1")) {
+                compalgor[ii] = GZIP_1;
+            } else if (!fits_strcasecmp(tempstring, "GZIP_2")) {
+                compalgor[ii] = GZIP_2;
+            } else if (!fits_strcasecmp(tempstring, "RICE_1")) {
+                compalgor[ii] = RICE_1;
+            } else {
+                ffpmsg("Unsupported table compression algorithm specification.");
+                ffpmsg(keyname);
+                ffpmsg(tempstring);
+                *status = DATA_COMPRESSION_ERR;
+                free(cm_buffer_base);
+                return(*status);
+            }
+        }
 
-	/* do sanity check of the requested algorithm and override if necessary */
-	if ( abs(coltype[ii]) == TLOGICAL || abs(coltype[ii]) == TBIT || abs(coltype[ii]) == TSTRING) {
-	        if (compalgor[ii] != GZIP_1) {
-			compalgor[ii] = GZIP_1;
-		}
-	} else if ( abs(coltype[ii]) == TCOMPLEX || abs(coltype[ii]) == TDBLCOMPLEX ||
-	                abs(coltype[ii]) == TFLOAT   || abs(coltype[ii]) == TDOUBLE ||
-			abs(coltype[ii]) == TLONGLONG ) {
-	        if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2) {
-			compalgor[ii] = GZIP_2;  /* gzip_2 usually works better gzip_1 */
-		}
-	} else if ( abs(coltype[ii]) == TSHORT ) {
-	        if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2 && compalgor[ii] != RICE_1) {
-			compalgor[ii] = GZIP_2;  /* gzip_2 usually works better rice_1 */
-		 }
-	} else if (  abs(coltype[ii]) == TLONG	) {
-	        if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2 && compalgor[ii] != RICE_1) {
-			compalgor[ii] = RICE_1;
-		}
-	} else if ( abs(coltype[ii]) == TBYTE ) {
-	        if (compalgor[ii] != GZIP_1 && compalgor[ii] != RICE_1 ) {
-			compalgor[ii] = GZIP_1;
-		}
-	}
+        /* do sanity check of the requested algorithm and override if necessary */
+        if ( abs(coltype[ii]) == TLOGICAL || abs(coltype[ii]) == TBIT || abs(coltype[ii]) == TSTRING) {
+            if (compalgor[ii] != GZIP_1) {
+                compalgor[ii] = GZIP_1;
+            }
+        } else if ( abs(coltype[ii]) == TCOMPLEX || abs(coltype[ii]) == TDBLCOMPLEX ||
+                    abs(coltype[ii]) == TFLOAT   || abs(coltype[ii]) == TDOUBLE ||
+                    abs(coltype[ii]) == TLONGLONG ) {
+            if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2) {
+                compalgor[ii] = GZIP_2;  /* gzip_2 usually works better gzip_1 */
+            }
+        } else if ( abs(coltype[ii]) == TSHORT ) {
+            if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2 && compalgor[ii] != RICE_1) {
+                compalgor[ii] = GZIP_2;  /* gzip_2 usually works better rice_1 */
+            }
+        } else if (  abs(coltype[ii]) == TLONG	) {
+            if (compalgor[ii] != GZIP_1 && compalgor[ii] != GZIP_2 && compalgor[ii] != RICE_1) {
+                compalgor[ii] = RICE_1;
+            }
+        } else if ( abs(coltype[ii]) == TBYTE ) {
+            if (compalgor[ii] != GZIP_1 && compalgor[ii] != RICE_1 ) {
+                compalgor[ii] = GZIP_1;
+            }
+        }
     }  /* end of loop over columns */
 
     /* ================================================================================== */
@@ -8288,408 +8298,456 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 
     tot_uncompressed_size = 0.;
     tot_compressed_size = 0;
-    firstrow = 1;
-    for (ll = 0; ll < nchunks; ll++) {
 
-        if (ll == nchunks - 1) {  /* the last chunk may have fewer rows */
-	    rowspertile = lastrows; 
-            for (ii = 0; ii < ncols; ii++) { 
-		cm_colstart[ii + 1] = cm_colstart[ii] + (rm_colwidth[ii] * rowspertile);
-		cm_repeat[ii] = rm_repeat[ii] * rowspertile;
-	    }
-	}
-
-        /* move to the start of the chunk in the input table */
-        ffmbyt(infptr, datastart, 0, status);
-
-        /* ================================================================================*/
-        /*  First, transpose this chunck from row-major order to column-major order  */
-	/*  At the same time, shuffle the bytes in each datum, if doing GZIP_2 compression */
-        /* ================================================================================*/
-
-        for (jj = 0; jj < rowspertile; jj++)   {    /* loop over rows */
-          for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
-      
-           if (rm_repeat[ii] > 0) {  /*  skip virtual columns that have 0 elements */
-
-	    kk = 0;	
-
-	     /* if the  GZIP_2 compression algorithm is used, shuffle the bytes */
-	    if (coltype[ii] == TSHORT && compalgor[ii] == GZIP_2) {
-	      while(kk < rm_colwidth[ii]) {
-	        cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/2);  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
-	        kk += 2;
-	      }
-	    } else if ((coltype[ii] == TFLOAT || coltype[ii] == TLONG) && compalgor[ii] == GZIP_2) {
-	      while(kk < rm_colwidth[ii]) {
-	        cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/4);  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 3rd byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 4th byte */
-	        kk += 4;
-	      }
-	    } else if ( (coltype[ii] == TDOUBLE || coltype[ii] == TLONGLONG) && compalgor[ii] == GZIP_2) {
-	      while(kk < rm_colwidth[ii]) {
-	        cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/8);  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 3rd byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 4th byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 5th byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 6th byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 7th byte */
-	        cptr += cm_repeat[ii];  
-	        ffgbyt(infptr, 1, cptr, status);  /* get 8th byte */
-	        kk += 8;
-	      }
-	    } else  { /* all other cases: don't shuffle the bytes; simply transpose the column */
-	        cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_colwidth[ii]));   /* addr to copy to */
-	        startbyte = (infptr->Fptr)->bytepos;  /* save the starting byte location */
-	        ffgbyt(infptr, rm_colwidth[ii], cptr, status);  /* copy all the bytes */
-
-	        if (rm_colwidth[ii] >= MINDIRECT) { /* have to explicitly move to next byte */
-	  	    ffmbyt(infptr, startbyte + rm_colwidth[ii], 0, status);
-	        }
-	    }  /* end of test of coltypee */
-
-           }  /* end of not virtual column */
-          }  /* end of loop over columns */
-        }  /* end of loop over rows */
-
-        /* ================================================================================*/
-        /*  now compress each column in the transposed chunk of the table    */
-        /* ================================================================================*/
-
-        fits_set_hdustruc(outfptr, status);  /* initialize structures in the output table */
     
-        for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
-	  /* initialize the diagnostic compression results string */
-	  snprintf(results[ii],30,"%3d %3d %3d ", ii+1, coltype[ii], compalgor[ii]);  
-          cratio[ii] = 0;
-	  
-          if (rm_repeat[ii] > 0) {  /* skip virtual columns with zero width */
+    for (ii = 0; ii < ncols; ii++) {/* only write the ZCTYPn keyword once, before processing the first column */
+        fits_make_keyn("ZCTYP", ii+1, keyname, status);
 
-	    if (coltype[ii] < 0)  {  /* this is a variable length array (VLA) column */
+        if (compalgor[ii] == RICE_1) {
+            strcpy(keyvalue, "RICE_1");
+        } else if (compalgor[ii] == GZIP_2) {
+            strcpy(keyvalue, "GZIP_2");
+        } else {
+            strcpy(keyvalue, "GZIP_1");
+        }
 
-		/*=========================================================================*/	    
-	        /* variable-length array columns are a complicated special case  */
-		/*=========================================================================*/
+        fits_write_key(outfptr, TSTRING, keyname, keyvalue,
+            "compression algorithm for column", status);
+    }
+    
 
-		/* allocate memory to hold all the VLA descriptors from the input table, plus */
-		/* room to hold the descriptors to the compressed VLAs in the output table */
-		/* In total, there will be 2 descriptors for each row in this chunk */
+    #pragma omp parallel default(shared) reduction(+:tot_uncompressed_size, tot_compressed_size) \
+            private(ii, jj, kk, ll, cm_buffer, cptr, datapos, startbyte, results, uncompressed_size, \
+            compressed_size, cratio, datasize, cdescript, descriptors, pdescriptors, outdescript, \
+            vlalen, vlastart, vlamemlen, vlamem, compmemlen, cvlamem, bytepos, dlen)\
+            firstprivate(rowspertile, cm_colstart, cm_repeat, tempstring)
+    {
+        int tid = omp_get_thread_num();
+        cm_buffer = cm_buffer_base + tid*naxis1*rowspertile;    
+        /*  firstrow = 1; */
+        #pragma omp for schedule(dynamic)
+        for (ll = 0; ll < nchunks; ll++) {    
+            if (*status > 0) continue;
+            datapos = datastart + ll * naxis1 * rowspertile;
+            if (ll == nchunks - 1) {  /* the last chunk may have fewer rows */
+                rowspertile = lastrows; 
+                for (ii = 0; ii < ncols; ii++) { 
+                    cm_colstart[ii + 1] = cm_colstart[ii] + (rm_colwidth[ii] * rowspertile);
+                    cm_repeat[ii] = rm_repeat[ii] * rowspertile;
+                }
+            }
+            
+            /* move to the start of the chunk in the input table */
+            #pragma omp critical (read_uncomp_file)
+            {
+                ffmbyt(infptr, datapos, 0, status);
 
-		uncompressed_size = 0.;
-		compressed_size = 0;
-		
-		datasize = (size_t) (cm_colstart[ii + 1] - cm_colstart[ii]); /* size of input descriptors */
+                /* ================================================================================*/
+                /*  First, transpose this chunck from row-major order to column-major order        */
+                /*  At the same time, shuffle the bytes in each datum, if doing GZIP_2 compression */
+                /* ================================================================================*/
 
-		cdescript =  calloc(datasize + (rowspertile * 16), 1); /* room for both descriptors */
-		if (!cdescript) {
-                    ffpmsg("Could not allocate buffer for descriptors");
-                    *status = MEMORY_ALLOCATION;
-		    free(cm_buffer);
-	            return(*status);
-		}
+                for (jj = 0; jj < rowspertile; jj++)   {    /* loop over rows */
+                    for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
+            
+                        if (rm_repeat[ii] > 0) {  /*  skip virtual columns that have 0 elements */
 
-		/* copy the input descriptors to this array */
-		memcpy(cdescript, &cm_buffer[cm_colstart[ii]], datasize);
-#if BYTESWAPPED
-		/* byte-swap the integer values into the native machine representation */
-		if (rm_colwidth[ii] == 16) {
-		    ffswap8((double *) cdescript,  rowspertile * 2);
-		} else {
-		    ffswap4((int *) cdescript,  rowspertile * 2);
-		}
-#endif
-		descriptors = (LONGLONG *) cdescript;  /* use this for Q type descriptors */
-		pdescriptors = (int *) cdescript;     /* use this instead for or P type descriptors */
-		/* pointer to the 2nd set of descriptors */
-		outdescript = (LONGLONG *) (cdescript + datasize);  /* this is a LONGLONG pointer */
-		
-		for (jj = 0; jj < rowspertile; jj++)   {    /* loop to compress each VLA in turn */
+                            kk = 0;	
 
-		  if (rm_colwidth[ii] == 16) { /* if Q pointers */
-			vlalen = descriptors[jj * 2];
-			vlastart = descriptors[(jj * 2) + 1];
-		  } else {  /* if P pointers */
-			vlalen = (LONGLONG) pdescriptors[jj * 2];
-			vlastart = (LONGLONG) pdescriptors[(jj * 2) + 1];
-		  }
+                            /* if the  GZIP_2 compression algorithm is used, shuffle the bytes */
+                            if (coltype[ii] == TSHORT && compalgor[ii] == GZIP_2) {
+                                while(kk < rm_colwidth[ii]) {
+                                    cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/2);  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
+                                    kk += 2;
+                                }
+                            } else if ((coltype[ii] == TFLOAT || coltype[ii] == TLONG) && compalgor[ii] == GZIP_2) {
+                                while(kk < rm_colwidth[ii]) {
+                                    cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/4);  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 3rd byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 4th byte */
+                                    kk += 4;
+                                }
+                            } else if ( (coltype[ii] == TDOUBLE || coltype[ii] == TLONGLONG) && compalgor[ii] == GZIP_2) {
+                                while(kk < rm_colwidth[ii]) {
+                                    cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_repeat[ii]) + kk/8);  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 1st byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 2nd byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 3rd byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 4th byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 5th byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 6th byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 7th byte */
+                                    cptr += cm_repeat[ii];  
+                                    ffgbyt(infptr, 1, cptr, status);  /* get 8th byte */
+                                    kk += 8;
+                                }
+                            } else  { /* all other cases: don't shuffle the bytes; simply transpose the column */
+                                cptr = cm_buffer + (cm_colstart[ii] + (jj * rm_colwidth[ii]));   /* addr to copy to */
+                                startbyte = (infptr->Fptr)->bytepos;  /* save the starting byte location */
+                                ffgbyt(infptr, rm_colwidth[ii], cptr, status);  /* copy all the bytes */
 
-		  if (vlalen > 0) {  /* skip zero-length VLAs */
+                                if (rm_colwidth[ii] >= MINDIRECT) { /* have to explicitly move to next byte */
+                                    ffmbyt(infptr, startbyte + rm_colwidth[ii], 0, status);
+                                }
+                            }  /* end of test of coltypee */
 
-		    vlamemlen = vlalen * (int) (-coltype[ii] / 10);
-		    vlamem = (LONGLONG *) malloc((size_t) vlamemlen); /* memory for the input uncompressed VLA */
-		    if (!vlamem) {
-			ffpmsg("Could not allocate buffer for VLA");
-			*status = MEMORY_ALLOCATION;
-			free(cdescript); free(cm_buffer);
-			return(*status);
-		    }
+                        }  /* end of not virtual column */
+                    }  /* end of loop over columns */
+                }  /* end of loop over rows */
+            }
+            /* ================================================================================*/
+            /*  now compress each column in the transposed chunk of the table    */
+            /* ================================================================================*/
+            #pragma omp critical (rw_comp_file)
+                fits_set_hdustruc(outfptr, status);  /* initialize structures in the output table */
+        
+            for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
+                /* initialize the diagnostic compression results string */
+                snprintf(results[ii],30,"%3d %3d %3d ", ii+1, coltype[ii], compalgor[ii]);  
+                cratio[ii] = 0;
+            
+                if (rm_repeat[ii] > 0) {  /* skip virtual columns with zero width */
 
-		    compmemlen = (size_t) (vlalen * ((LONGLONG) (-coltype[ii] / 10)) * 1.5);
-		    if (compmemlen < 100) compmemlen = 100;
-		    cvlamem = malloc(compmemlen);  /* memory for the output compressed VLA */
-		    if (!cvlamem) {
-			ffpmsg("Could not allocate buffer for compressed data");
-			*status = MEMORY_ALLOCATION;
-			free(vlamem); free(cdescript); free(cm_buffer);
-			return(*status);
-		    }
+                    if (coltype[ii] < 0)  {  /* this is a variable length array (VLA) column */
 
-		    /* read the raw bytes directly from the heap, without any byte-swapping or null value detection */
-		    bytepos = (infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + vlastart;
-		    ffmbyt(infptr, bytepos, REPORT_EOF, status);
-		    ffgbyt(infptr, vlamemlen, vlamem, status);  /* read the bytes */
-		    uncompressed_size += vlamemlen;  /* total size of the uncompressed VLAs */
-		    tot_uncompressed_size += vlamemlen;  /* total size of the uncompressed file */
+                        /*=========================================================================*/	    
+                            /* variable-length array columns are a complicated special case  */
+                        /*=========================================================================*/
 
-		    /* compress the VLA with the appropriate algorithm */
-	    	    if (compalgor[ii] == RICE_1) {
+                        /* allocate memory to hold all the VLA descriptors from the input table, plus */
+                        /* room to hold the descriptors to the compressed VLAs in the output table */
+                        /* In total, there will be 2 descriptors for each row in this chunk */
 
-		        if (-coltype[ii] == TSHORT) {
-#if BYTESWAPPED
-			  ffswap2((short *) (vlamem),  (long) vlalen); 
-#endif
-			  dlen = fits_rcomp_short ((short *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
-			   (int) compmemlen, 32);
-		        } else if (-coltype[ii] == TLONG) {
-#if BYTESWAPPED
-			  ffswap4((int *) (vlamem),  (long) vlalen); 
-#endif
-			  dlen = fits_rcomp ((int *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
-                           (int) compmemlen, 32);
-		        } else if (-coltype[ii] == TBYTE) {
-			  dlen = fits_rcomp_byte ((signed char *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
-                           (int) compmemlen, 32);
-		        } else {
-			  /* this should not happen */
-			  ffpmsg(" Error: cannot compress this column type with the RICE algorithm");
-			  free(vlamem); free(cdescript); free(cm_buffer); free(cvlamem);
-			  *status = DATA_COMPRESSION_ERR;
-			  return(*status);
-		        }  
-		    } else if (compalgor[ii] == GZIP_1 || compalgor[ii] == GZIP_2){  
-		       if (compalgor[ii] == GZIP_2 ) {  /* shuffle the bytes before gzipping them */
-			   if ( (int) (-coltype[ii] / 10) == 2) {
-			       fits_shuffle_2bytes((char *) vlamem, vlalen, status);
-			   } else if ( (int) (-coltype[ii] / 10) == 4) {
-			       fits_shuffle_4bytes((char *) vlamem, vlalen, status);
-			   } else if ( (int) (-coltype[ii] / 10) == 8) {
-			       fits_shuffle_8bytes((char *) vlamem, vlalen, status);
-			   }
-		        }
-		        /*: gzip compress the array of bytes */
-		        compress2mem_from_mem( (char *) vlamem, (size_t) vlamemlen,
-	    		    &cvlamem,  &compmemlen, realloc, &dlen, status);        
-		    } else {
-			  /* this should not happen */
-			  ffpmsg(" Error: unknown compression algorithm");
-			  free(vlamem); free(cdescript); free(cm_buffer); free(cvlamem);
-			  *status = DATA_COMPRESSION_ERR;
-			  return(*status);
-		    }  
+                        uncompressed_size = 0.;
+                        compressed_size = 0;
+                        
+                        datasize = (size_t) (cm_colstart[ii + 1] - cm_colstart[ii]); /* size of input descriptors */
 
-		    /* write the compressed array to the output table, but... */
-		    /* We use a trick of always writing the array to the same row of the output table */
-		    /* and then copy the descriptor into the array of descriptors that we allocated. */
-		     
-		    /* First, reset the descriptor */
-		    fits_write_descript(outfptr, ii+1, ll+1, 0, 0, status);
+                        cdescript =  calloc(datasize + (rowspertile * 16), 1); /* room for both descriptors */
+                        if (!cdescript) {
+                            ffpmsg("Could not allocate buffer for descriptors");
+                            #pragma omp critical (set_status)
+                                *status = MEMORY_ALLOCATION;
+                            /* free(cm_buffer); 
+                               return(*status); */
+                            continue;
+                        }
 
-		    /* write the compressed VLA if it is smaller than the original, else write */
-		    /* the uncompressed array */
-		    fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
-		    if (dlen < vlamemlen) {
-		        fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
-		        compressed_size += dlen;  /* total size of the compressed VLAs */
-		        tot_compressed_size += dlen;  /* total size of the compressed file */
-		    } else {
-			if ( -coltype[ii] != TBYTE && compalgor[ii] != GZIP_1) {
-			    /* it is probably faster to reread the raw bytes, rather than unshuffle or unswap them */
-			    bytepos = (infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + vlastart;
-			    ffmbyt(infptr, bytepos, REPORT_EOF, status);
-			    ffgbyt(infptr, vlamemlen, vlamem, status);  /* read the bytes */
-			}
-		        fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, vlamemlen, vlamem, status);
-		        compressed_size += vlamemlen;  /* total size of the compressed VLAs */
-		        tot_compressed_size += vlamemlen;  /* total size of the compressed file */
-		    }
+                        /* copy the input descriptors to this array */
+                        memcpy(cdescript, &cm_buffer[cm_colstart[ii]], datasize);
+                        #if BYTESWAPPED
+                        /* byte-swap the integer values into the native machine representation */
+                        if (rm_colwidth[ii] == 16) {
+                            ffswap8((double *) cdescript,  rowspertile * 2);
+                        } else {
+                            ffswap4((int *) cdescript,  rowspertile * 2);
+                        }
+                        #endif
+                        descriptors = (LONGLONG *) cdescript;  /* use this for Q type descriptors */
+                        pdescriptors = (int *) cdescript;     /* use this instead for or P type descriptors */
+                        /* pointer to the 2nd set of descriptors */
+                        outdescript = (LONGLONG *) (cdescript + datasize);  /* this is a LONGLONG pointer */
+                        
+                        for (jj = 0; jj < rowspertile; jj++)   {    /* loop to compress each VLA in turn */
 
-		    /* read back the descriptor and save it in the array of descriptors */
-		    fits_read_descriptll(outfptr, ii + 1, ll + 1, outdescript+(jj*2), outdescript+(jj*2)+1, status);
-		    free(cvlamem);  free(vlamem);
+                            if (rm_colwidth[ii] == 16) { /* if Q pointers */
+                                vlalen = descriptors[jj * 2];
+                                vlastart = descriptors[(jj * 2) + 1];
+                            } else {  /* if P pointers */
+                                vlalen = (LONGLONG) pdescriptors[jj * 2];
+                                vlastart = (LONGLONG) pdescriptors[(jj * 2) + 1];
+                            }
 
-		  } /* end of vlalen > 0 */
-		}  /* end of loop over rows */
+                            if (vlalen > 0) {  /* skip zero-length VLAs */
 
-		if (compressed_size != 0)
-		    cratio[ii] = uncompressed_size / compressed_size;
+                                vlamemlen = vlalen * (int) (-coltype[ii] / 10);
+                                vlamem = (LONGLONG *) malloc((size_t) vlamemlen); /* memory for the input uncompressed VLA */
+                                if (!vlamem) {
+                                    ffpmsg("Could not allocate buffer for VLA");
+                                    #pragma omp critical (set_status)
+                                        *status = MEMORY_ALLOCATION;
+                                    free(cdescript); 
+                                    /* free(cm_buffer);
+                                       return(*status); */
+                                    continue;
+                                }
 
-		snprintf(tempstring,FLEN_VALUE," r=%6.2f",cratio[ii]);
-		strncat(results[ii],tempstring, 29-strlen(results[ii]));
+                                compmemlen = (size_t) (vlalen * ((LONGLONG) (-coltype[ii] / 10)) * 1.5);
+                                if (compmemlen < 100) compmemlen = 100;
+                                cvlamem = malloc(compmemlen);  /* memory for the output compressed VLA */
+                                if (!cvlamem) {
+                                    ffpmsg("Could not allocate buffer for compressed data");
+                                    #pragma omp critical (set_status)
+                                        *status = MEMORY_ALLOCATION;
+                                    free(vlamem); free(cdescript);
+                                    /* free(cm_buffer);
+                                    return(*status); */
+                                    continue;
+                                }
 
-		/* now we just have to compress the array of descriptors (both input and output) */
-		/* and write them to the output table. */
+                                /* read the raw bytes directly from the heap, without any byte-swapping or null value detection */
+                                #pragma omp critical (read_uncomp_file)
+                                {
+                                    bytepos = (infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + vlastart;
+                                    ffmbyt(infptr, bytepos, REPORT_EOF, status);
+                                    ffgbyt(infptr, vlamemlen, vlamem, status);  /* read the bytes */
+                                }
+                                uncompressed_size += vlamemlen;  /* total size of the uncompressed VLAs */
+                                tot_uncompressed_size += vlamemlen;  /* total size of the uncompressed file */
 
-		/* allocate memory for the compressed descriptors */
-		cvlamem = malloc(datasize + (rowspertile * 16) );
-		if (!cvlamem) {
-		    ffpmsg("Could not allocate buffer for compressed data");
-		    *status = MEMORY_ALLOCATION;
-		    free(cdescript); free(cm_buffer);
-		    return(*status);
-		}
+                                /* compress the VLA with the appropriate algorithm */
+                                if (compalgor[ii] == RICE_1) {
 
-#if BYTESWAPPED
-		/* byte swap the input and output descriptors */
-		if (rm_colwidth[ii] == 16) {
-		    ffswap8((double *) cdescript,  rowspertile * 2);
-		} else {
-		    ffswap4((int *) cdescript,  rowspertile * 2);
-		}
-		ffswap8((double *) outdescript,  rowspertile * 2);
-#endif
-		/* compress the array contain both sets of descriptors */
-		compress2mem_from_mem((char *) cdescript, datasize + (rowspertile * 16),
-	    		&cvlamem,  &datasize, realloc, &dlen, status);        
+                                    if (-coltype[ii] == TSHORT) {
+                                        #if BYTESWAPPED
+                                        ffswap2((short *) (vlamem),  (long) vlalen); 
+                                        #endif
+                                        dlen = fits_rcomp_short ((short *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
+                                            (int) compmemlen, 32);
+                                    } else if (-coltype[ii] == TLONG) {
+                                        #if BYTESWAPPED
+                                        ffswap4((int *) (vlamem),  (long) vlalen); 
+                                        #endif
+                                        dlen = fits_rcomp ((int *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
+                                            (int) compmemlen, 32);
+                                    } else if (-coltype[ii] == TBYTE) {
+                                        dlen = fits_rcomp_byte ((signed char *)(vlamem), (int) vlalen, (unsigned char *) cvlamem,
+                                            (int) compmemlen, 32);
+                                    } else {
+                                        /* this should not happen */
+                                        ffpmsg(" Error: cannot compress this column type with the RICE algorithm");
+                                        free(vlamem); free(cdescript); free(cvlamem);
+                                        #pragma omp critical (set_status)
+                                            *status = DATA_COMPRESSION_ERR;
+                                        /* free(cm_buffer);
+                                           return(*status); */
+                                        continue;
+                                    }  
+                                } else if (compalgor[ii] == GZIP_1 || compalgor[ii] == GZIP_2){  
+                                    if (compalgor[ii] == GZIP_2 ) {  /* shuffle the bytes before gzipping them */
+                                        if ( (int) (-coltype[ii] / 10) == 2) {
+                                            fits_shuffle_2bytes((char *) vlamem, vlalen, status);
+                                        } else if ( (int) (-coltype[ii] / 10) == 4) {
+                                            fits_shuffle_4bytes((char *) vlamem, vlalen, status);
+                                        } else if ( (int) (-coltype[ii] / 10) == 8) {
+                                            fits_shuffle_8bytes((char *) vlamem, vlalen, status);
+                                        }
+                                    }
+                                    /*: gzip compress the array of bytes */
+                                    compress2mem_from_mem( (char *) vlamem, (size_t) vlamemlen,
+                                        &cvlamem,  &compmemlen, realloc, &dlen, status);        
+                                } else {
+                                    /* this should not happen */
+                                    ffpmsg(" Error: unknown compression algorithm");
+                                    free(vlamem); free(cdescript); free(cvlamem);
+                                    #pragma omp critical (set_status)
+                                        *status = DATA_COMPRESSION_ERR;
+                                    /* free(cm_buffer);
+                                       return(*status); */
+                                       continue;
+                                }  
 
-		free(cdescript);
+                                /* write the compressed array to the output table, but... */
+                                /* We use a trick of always writing the array to the same row of the output table */
+                                /* and then copy the descriptor into the array of descriptors that we allocated. */
+                                
+                                /* First, reset the descriptor */
+                                #pragma omp critical (rw_comp_file)
+                                    fits_write_descript(outfptr, ii+1, ll+1, 0, 0, status);
 
-		/* write the compressed descriptors to the output column */
-		fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
-		fits_write_descript(outfptr, ii+1, ll+1, 0, 0, status); /* First, reset the descriptor */
-		fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
-		free(cvlamem); 
+                                /* write the compressed VLA if it is smaller than the original, else write */
+                                /* the uncompressed array */
+                                if (dlen < vlamemlen) {
+                                    #pragma omp critical (rw_comp_file)
+                                    {
+                                        fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
+                                        fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
+                                    }
+                                    compressed_size += dlen;  /* total size of the compressed VLAs */
+                                    tot_compressed_size += dlen;  /* total size of the compressed file */
+                                } else {
+                                    if ( -coltype[ii] != TBYTE && compalgor[ii] != GZIP_1) {
+                                        /* it is probably faster to reread the raw bytes, rather than unshuffle or unswap them */
+                                        #pragma omp critical (read_uncomp_file)
+                                        {
+                                            bytepos = (infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + vlastart;
+                                            ffmbyt(infptr, bytepos, REPORT_EOF, status);
+                                            ffgbyt(infptr, vlamemlen, vlamem, status);  /* read the bytes */
+                                        }
+                                    }
+                                    #pragma omp critical (rw_comp_file)
+                                    {
+                                        fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
+                                        fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, vlamemlen, vlamem, status);
+                                    }
+                                    compressed_size += vlamemlen;  /* total size of the compressed VLAs */
+                                    tot_compressed_size += vlamemlen;  /* total size of the compressed file */
+                                }
 
-		if (ll == 0) {  /* only write the ZCTYPn keyword once, while processing the first column */
-			fits_make_keyn("ZCTYP", ii+1, keyname, status);
+                                /* read back the descriptor and save it in the array of descriptors */
+                                #pragma omp critical (rw_comp_file)
+                                    fits_read_descriptll(outfptr, ii + 1, ll + 1, outdescript+(jj*2), outdescript+(jj*2)+1, status);
+                                free(cvlamem);  free(vlamem);
 
-			if (compalgor[ii] == RICE_1) {
-			     strcpy(keyvalue, "RICE_1");
-			} else if (compalgor[ii] == GZIP_2) {
-			     strcpy(keyvalue, "GZIP_2");
-			} else {
-			     strcpy(keyvalue, "GZIP_1");
-			}
+                            } /* end of vlalen > 0 */
+                        }  /* end of loop over rows */
 
-			fits_write_key(outfptr, TSTRING, keyname, keyvalue,
-			"compression algorithm for column", status);
-		}
+                        if (compressed_size != 0)
+                            cratio[ii] = uncompressed_size / compressed_size;
 
-	        continue;  /* jump to end of loop, to go to next column */
-	    }  /* end of VLA case */
+                        snprintf(tempstring,FLEN_VALUE," r=%6.2f",cratio[ii]);
+                        strncat(results[ii],tempstring, 29-strlen(results[ii]));
 
-	    /* ================================================================================*/
-	    /* deal with all the normal fixed-length columns here */
-	    /* ================================================================================*/
+                        /* now we just have to compress the array of descriptors (both input and output) */
+                        /* and write them to the output table. */
 
-	    /* allocate memory for the compressed data */
-	    datasize = (size_t) (cm_colstart[ii + 1] - cm_colstart[ii]);
-	    cvlamem = malloc(datasize*2);
-	    tot_uncompressed_size += datasize;
-	    
-	    if (!cvlamem) {
-                ffpmsg("Could not allocate buffer for compressed data");
-                *status = MEMORY_ALLOCATION;
-		free(cm_buffer);
-	        return(*status);
-	    }
+                        /* allocate memory for the compressed descriptors */
+                        cvlamem = malloc(datasize + (rowspertile * 16) );
+                        if (!cvlamem) {
+                            ffpmsg("Could not allocate buffer for compressed data");
+                            #pragma omp critical (set_status)
+                                *status = MEMORY_ALLOCATION;
+                            free(cdescript);
+                            /* free(cm_buffer);
+                            return(*status); */
+                            continue;
+                        }
 
-	    if (compalgor[ii] == RICE_1) {
-	        if (coltype[ii] == TSHORT) {
-#if BYTESWAPPED
-                    ffswap2((short *) (cm_buffer + cm_colstart[ii]),  datasize / 2); 
-#endif
-  	            dlen = fits_rcomp_short ((short *)(cm_buffer + cm_colstart[ii]), datasize / 2, (unsigned char *) cvlamem,
-                       datasize * 2, 32);
+                        #if BYTESWAPPED
+                        /* byte swap the input and output descriptors */
+                        if (rm_colwidth[ii] == 16) {
+                            ffswap8((double *) cdescript,  rowspertile * 2);
+                        } else {
+                            ffswap4((int *) cdescript,  rowspertile * 2);
+                        }
+                        ffswap8((double *) outdescript,  rowspertile * 2);
+                        #endif
+                        /* compress the array contain both sets of descriptors */
+                        compress2mem_from_mem((char *) cdescript, datasize + (rowspertile * 16),
+                                &cvlamem,  &datasize, realloc, &dlen, status);        
 
-	        } else if (coltype[ii] == TLONG) {
-#if BYTESWAPPED
-                    ffswap4((int *) (cm_buffer + cm_colstart[ii]),  datasize / 4); 
-#endif
-   	            dlen = fits_rcomp ((int *)(cm_buffer + cm_colstart[ii]), datasize / 4, (unsigned char *) cvlamem,
-                       datasize * 2, 32);
+                        free(cdescript);
 
-	        } else if (coltype[ii] == TBYTE) {
+                        /* write the compressed descriptors to the output column */
+                        #pragma omp critical (rw_comp_file)
+                        {
+                            fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
+                            fits_write_descript(outfptr, ii+1, ll+1, 0, 0, status); /* First, reset the descriptor */
+                            fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
+                        }
+                        free(cvlamem); 
 
-  	            dlen = fits_rcomp_byte ((signed char *)(cm_buffer + cm_colstart[ii]), datasize, (unsigned char *) cvlamem,
-                       datasize * 2, 32);
-	        } else {  /* this should not happen */
-                    ffpmsg(" Error: cannot compress this column type with the RICE algorthm");
-		    free(cvlamem);  free(cm_buffer);
-	            *status = DATA_COMPRESSION_ERR;
-	            return(*status);
-	        }
-	    } else {
-	    	/* all other cases: gzip compress the column (bytes may have been shuffled previously) */
-		compress2mem_from_mem(cm_buffer + cm_colstart[ii], datasize,
-	    		&cvlamem,  &datasize, realloc, &dlen, status);        
-	    }
+                        continue;  /* jump to end of loop, to go to next column */
+                    }  /* end of VLA case */
 
-	    if (ll == 0) {  /* only write the ZCTYPn keyword once, while processing the first column */
-		fits_make_keyn("ZCTYP", ii+1, keyname, status);
+                    /* ================================================================================*/
+                    /* deal with all the normal fixed-length columns here */
+                    /* ================================================================================*/
 
-		if (compalgor[ii] == RICE_1) {
-		     strcpy(keyvalue, "RICE_1");
-		} else if (compalgor[ii] == GZIP_2) {
-		     strcpy(keyvalue, "GZIP_2");
-		} else {
-		     strcpy(keyvalue, "GZIP_1");
-		}
+                    /* allocate memory for the compressed data */
+                    datasize = (size_t) (cm_colstart[ii + 1] - cm_colstart[ii]);
+                    cvlamem = malloc(datasize*2);
+                    tot_uncompressed_size += datasize;
+                    
+                    int datasize_copy = datasize;
 
-		fits_write_key(outfptr, TSTRING, keyname, keyvalue,
-		"compression algorithm for column", status);
-	    }
+                    if (!cvlamem) {
+                        ffpmsg("Could not allocate buffer for compressed data");
+                        #pragma omp critical (set_status)
+                            *status = MEMORY_ALLOCATION;
+                        /* free(cm_buffer);
+                          return(*status); */
+                        continue;
+                    }
 
-	    /* write the compressed data to the output column */
-	    fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
-	    fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
-	    tot_compressed_size += dlen;
+                    if (compalgor[ii] == RICE_1) {
+                        if (coltype[ii] == TSHORT) {
+                            #if BYTESWAPPED
+                            ffswap2((short *) (cm_buffer + cm_colstart[ii]),  datasize / 2); 
+                            #endif
+                            dlen = fits_rcomp_short ((short *)(cm_buffer + cm_colstart[ii]), datasize / 2, (unsigned char *) cvlamem,
+                                datasize * 2, 32);
 
-	    free(cvlamem);   /* don't need the compressed data any more */
+                        } else if (coltype[ii] == TLONG) {
+                            #if BYTESWAPPED
+                            ffswap4((int *) (cm_buffer + cm_colstart[ii]),  datasize / 4); 
+                            #endif
+                            dlen = fits_rcomp ((int *)(cm_buffer + cm_colstart[ii]), datasize / 4, (unsigned char *) cvlamem,
+                                datasize * 2, 32);
 
-            /* create diagnostic messages */
-	    if (dlen != 0)
-	       cratio[ii] = (float) datasize / (float) dlen;  /* compression ratio of the column */
+                        } else if (coltype[ii] == TBYTE) {
 
-	    snprintf(tempstring,FLEN_VALUE," r=%6.2f",cratio[ii]);
-	    strncat(results[ii],tempstring,29-strlen(results[ii]));
- 
-          }  /* end of not a virtual column */
-        }  /* end of loop over columns */
+                            dlen = fits_rcomp_byte ((signed char *)(cm_buffer + cm_colstart[ii]), datasize, (unsigned char *) cvlamem,
+                                datasize * 2, 32);
+                        } else {  /* this should not happen */
+                            ffpmsg(" Error: cannot compress this column type with the RICE algorthm");
+                            free(cvlamem);
+                            #pragma omp critical (set_status)
+                                *status = DATA_COMPRESSION_ERR;
+                            /* free(cm_buffer);
+                               return(*status); */
+                               continue;
+                        }
+                    } else {
+                        /* all other cases: gzip compress the column (bytes may have been shuffled previously) */
+                        compress2mem_from_mem(cm_buffer + cm_colstart[ii], datasize,
+                            &cvlamem,  &datasize, realloc, &dlen, status);        
+                    }
 
-        datastart += (rowspertile * naxis1);   /* increment to start of next chunk */
-        firstrow += rowspertile;  /* increment first row in next chunk */
+                    /* write the compressed data to the output column */
+                    #pragma omp critical (rw_comp_file)
+                    {
+                        fits_set_tscale(outfptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
+                        fits_write_col(outfptr, TBYTE, ii + 1, ll+1, 1, dlen, cvlamem, status);
+                    }
+                    tot_compressed_size += dlen;
 
-       if (print_report) {
-	  printf("\nChunk = %d\n",ll+1);
-	  for (ii = 0; ii < ncols; ii++) {  
-		printf("%s\n", results[ii]);
-	  }
-	}
-	
-    }  /* end of loop over chunks of the table */
+                    free(cvlamem);   /* don't need the compressed data any more */
 
+                        /* create diagnostic messages */
+                    if (dlen != 0)
+                    cratio[ii] = (float) datasize_copy / (float) dlen;  /* compression ratio of the column */
+
+                    snprintf(tempstring,FLEN_VALUE," r=%6.2f",cratio[ii]);
+                    strncat(results[ii],tempstring,29-strlen(results[ii]));
+            
+                }  /* end of not a virtual column */
+            }  /* end of loop over columns */
+
+            /* datastart += (rowspertile * naxis1); */  /* increment to start of next chunk */
+            /* increment first row in next chunk */
+            /* firstrow += rowspertile;  */
+            #pragma omp critical (print_result)
+            {
+                if (print_report) {
+                    printf("\nChunk = %d\n",ll+1);
+                    for (ii = 0; ii < ncols; ii++) {  
+                        printf("%s\n", results[ii]);
+                    }
+                }
+            }
+
+        }  /* end of loop over chunks of the table */
+    }
     /* =================================================================================*/
     /*  all done; just clean up and return  */
     /* ================================================================================*/
 
-    free(cm_buffer);
+    free(cm_buffer_base);
     fits_set_hdustruc(outfptr, status);  /* reset internal structures */
        	
     if (print_report) {
@@ -8701,7 +8759,7 @@ int fits_compress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     return(*status);
 }
 /*--------------------------------------------------------------------------*/
-int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
+int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int num_worker, int *status)
 
 /*
   Uncompress the table that was compressed with fits_compress_table
@@ -8709,19 +8767,23 @@ int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 { 
     char colcode[999];  /* column data type code character */
     char coltype[999];  /* column data type numeric code value */
-    char *cm_buffer;   /* memory buffer for the transposed, Column-Major, chunk of the table */ 
-    char *rm_buffer;   /* memory buffer for the original, Row-Major, chunk of the table */ 
+    char *cm_buffer, *cm_buffer_base;   /* memory buffer for the transposed, Column-Major, chunk of the table */ 
+    char *rm_buffer, *rm_buffer_base;   /* memory buffer for the original, Row-Major, chunk of the table */ 
     LONGLONG nrows, rmajor_colwidth[999], rmajor_colstart[1000], cmajor_colstart[1000];
     LONGLONG cmajor_repeat[999], rmajor_repeat[999], cmajor_bytespan[999], kk;
-    LONGLONG headstart, datastart = 0, dataend, rowsremain, *descript, *qdescript = 0;
-    LONGLONG rowstart, cvlalen, cvlastart, vlalen, vlastart;
-    long repeat, width, vla_repeat, vla_address, rowspertile, ntile;
+    LONGLONG headstart, datastart = 0, datapos, dataend, rowstotal, *descript, *qdescript = 0, rowsfin;
+    LONGLONG cvlalen, cvlastart, vlalen, vlastart;
+    long repeat, width, vla_repeat, vla_address, rowspertile, ntile, nchunks;
     int  ncols, hdutype, inttype, anynull, tstatus, zctype[999], addspace = 0, *pdescript = 0;
     char *cptr, keyname[9], tform[40];
     long  pcount, zheapptr, naxis1, naxis2, ii, jj;
     char *ptr, comm[FLEN_COMMENT], zvalue[FLEN_VALUE], *uncompressed_vla = 0, *compressed_vla;
     char card[FLEN_CARD];
     size_t dlen, fullsize, cm_size, bytepos, vlamemlen;
+
+
+    /* avoid warnings for unused variables */
+    (void*)cmajor_bytespan;
 
     /* ================================================================================== */
     /* perform initial sanity checks */
@@ -8737,22 +8799,22 @@ int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     }
 
     if (fits_read_key(infptr, TLOGICAL, "ZTABLE", &tstatus, NULL, status)) {
-	/* just copy the HDU if the table is not compressed */
-	if (infptr != outfptr) { 
-		fits_copy_hdu (infptr, outfptr, 0, status);
-	}
-	return(*status);
+        /* just copy the HDU if the table is not compressed */
+        if (infptr != outfptr) { 
+            fits_copy_hdu (infptr, outfptr, 0, status);
+        }
+        return(*status);
     }
  
     fits_get_num_rowsll(infptr, &nrows, status);
     fits_get_num_cols(infptr, &ncols, status);
 
     if ((ncols < 1)) {
-	/* just copy the HDU if the table does not have  more than 0 columns */
-	if (infptr != outfptr) { 
-		fits_copy_hdu (infptr, outfptr, 0, status);
-	}
-	return(*status);
+        /* just copy the HDU if the table does not have  more than 0 columns */
+        if (infptr != outfptr) { 
+            fits_copy_hdu (infptr, outfptr, 0, status);
+        }
+        return(*status);
     }
 
     fits_read_key(infptr, TLONG, "ZTILELEN", &rowspertile, comm, status);
@@ -8831,69 +8893,69 @@ int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
     /* ================================================================================== */
     for (ii = 0; ii < ncols; ii++) {
 
-	/* get the original column type, repeat count, and unit width */
-	fits_make_keyn("ZFORM", ii+1, keyname, status);
-	fits_read_key(infptr, TSTRING, keyname, tform, comm, status);
+        /* get the original column type, repeat count, and unit width */
+        fits_make_keyn("ZFORM", ii+1, keyname, status);
+        fits_read_key(infptr, TSTRING, keyname, tform, comm, status);
 
-	/* restore the original TFORM value and comment */
-	fits_read_card(outfptr, keyname, card, status);
-	card[0] = 'T';
-	keyname[0] = 'T';
-	fits_update_card(outfptr, keyname, card, status);
+        /* restore the original TFORM value and comment */
+        fits_read_card(outfptr, keyname, card, status);
+        card[0] = 'T';
+        keyname[0] = 'T';
+        fits_update_card(outfptr, keyname, card, status);
 
-	/* now delete the ZFORM keyword */
-        keyname[0] = 'Z';
-	fits_delete_key(outfptr, keyname, status);
+        /* now delete the ZFORM keyword */
+            keyname[0] = 'Z';
+        fits_delete_key(outfptr, keyname, status);
 
-	cptr = tform;
-	while(isdigit(*cptr)) cptr++;
-	colcode[ii] = *cptr; /* save the column type code */
+        cptr = tform;
+        while(isdigit(*cptr)) cptr++;
+        colcode[ii] = *cptr; /* save the column type code */
 
         fits_binary_tform(tform, &inttype, &repeat, &width, status);
         coltype[ii] = inttype;
 
-	/* deal with special cases */
-	if (abs(coltype[ii]) == TBIT) { 
-	        repeat = (repeat + 7) / 8 ;   /* convert from bits to bytes */
-	} else if (abs(coltype[ii]) == TSTRING) {
-	        width = 1;
-	} else if (coltype[ii] < 0) {  /* pointer to variable length array */
-	        if (colcode[ii] == 'P')
-	           width = 8;  /* this is a 'P' column */
-	        else
-	           width = 16;  /* this is a 'Q' not a 'P' column */
+	    /* deal with special cases */
+        if (abs(coltype[ii]) == TBIT) { 
+            repeat = (repeat + 7) / 8 ;   /* convert from bits to bytes */
+        } else if (abs(coltype[ii]) == TSTRING) {
+            width = 1;
+        } else if (coltype[ii] < 0) {  /* pointer to variable length array */
+            if (colcode[ii] == 'P')
+                width = 8;  /* this is a 'P' column */
+            else
+                width = 16;  /* this is a 'Q' not a 'P' column */
 
-                addspace += 16; /* need space for a second set of Q pointers for this column */
-	}
+            addspace += 16; /* need space for a second set of Q pointers for this column */
+        }
 
-	rmajor_repeat[ii] = repeat;
+        rmajor_repeat[ii] = repeat;
 
-	/* width (in bytes) of each field in the row-major table */
-	rmajor_colwidth[ii] = rmajor_repeat[ii] * width;
+        /* width (in bytes) of each field in the row-major table */
+        rmajor_colwidth[ii] = rmajor_repeat[ii] * width;
 
-	/* construct the ZCTYPn keyword name then read the keyword */
-	fits_make_keyn("ZCTYP", ii+1, keyname, status);
-	tstatus = 0;
-        fits_read_key(infptr, TSTRING, keyname, zvalue, NULL, &tstatus);
-	if (tstatus) {
-           zctype[ii] = GZIP_2;
-	} else {
-	   if (!strcmp(zvalue, "GZIP_2")) {
-               zctype[ii] = GZIP_2;
-	   } else if (!strcmp(zvalue, "GZIP_1")) {
-               zctype[ii] = GZIP_1;
-	   } else if (!strcmp(zvalue, "RICE_1")) {
-               zctype[ii] = RICE_1;
-	   } else {
-	       ffpmsg("Unrecognized ZCTYPn keyword compression code:");
-	       ffpmsg(zvalue);
-	       *status = DATA_DECOMPRESSION_ERR;
-	       return(*status);
-	   }
-	   
-	   /* delete this keyword from the uncompressed header */
-	   fits_delete_key(outfptr, keyname, status);
-	}
+        /* construct the ZCTYPn keyword name then read the keyword */
+        fits_make_keyn("ZCTYP", ii+1, keyname, status);
+        tstatus = 0;
+            fits_read_key(infptr, TSTRING, keyname, zvalue, NULL, &tstatus);
+        if (tstatus) {
+            zctype[ii] = GZIP_2;
+        } else {
+            if (!strcmp(zvalue, "GZIP_2")) {
+                zctype[ii] = GZIP_2;
+            } else if (!strcmp(zvalue, "GZIP_1")) {
+                zctype[ii] = GZIP_1;
+            } else if (!strcmp(zvalue, "RICE_1")) {
+                zctype[ii] = RICE_1;
+            } else {
+                ffpmsg("Unrecognized ZCTYPn keyword compression code:");
+                ffpmsg(zvalue);
+                *status = DATA_DECOMPRESSION_ERR;
+                return(*status);
+            }
+            
+            /* delete this keyword from the uncompressed header */
+            fits_delete_key(outfptr, keyname, status);
+        }
     }
 
     /* rescan header keywords to reset internal table structure parameters */
@@ -8905,455 +8967,499 @@ int fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status)
 
     fullsize = naxis1 * rowspertile;
     cm_size = fullsize + (addspace * rowspertile);
+    
+    rowstotal = naxis2;
+    ntile = 0;
+    nchunks = (long)((rowstotal - 1) / rowspertile + 1);
 
-    cm_buffer = malloc(cm_size);
-    if (!cm_buffer) {
+    fits_get_hduaddrll(outfptr, &headstart, &datastart, &dataend, status);  
+    
+    // parallel execute using openmp
+    num_worker = (num_worker > nchunks) ? nchunks : num_worker;
+    omp_set_num_threads(num_worker);
+    cm_buffer_base = malloc(cm_size*num_worker);
+    if (!cm_buffer_base) {
         ffpmsg("Could not allocate buffer for transformed column-major table");
         *status = MEMORY_ALLOCATION;
         return(*status);
     }
 
-    rm_buffer = malloc(fullsize);
-    if (!rm_buffer) {
+    rm_buffer_base = malloc(fullsize*num_worker);
+    if (!rm_buffer_base) {
         ffpmsg("Could not allocate buffer for untransformed row-major table");
         *status = MEMORY_ALLOCATION;
-        free(cm_buffer);
+        free(cm_buffer_base);
         return(*status);
     }
 
-    /* ================================================================================== */
-    /* Main loop over all the tiles */
-    /* ================================================================================== */
 
-    rowsremain = naxis2;
-    rowstart = 1;
-    ntile = 0;
-
-    while(rowsremain) {
-
+    #pragma omp parallel default(shared) private(cm_buffer, rm_buffer, rmajor_colstart, cmajor_colstart, ii, jj, kk, \
+            cmajor_repeat, vla_repeat, vla_address, ptr, cptr, dlen, descript, cvlalen, cvlastart, vlalen, vlastart, \
+            vlamemlen, compressed_vla, bytepos, ntile, datapos) \
+            firstprivate(rowspertile, fullsize, pdescript, qdescript, uncompressed_vla) \
+            if (num_worker != 1)
+    {
+        int i, tid = omp_get_thread_num();
+        cm_buffer = cm_buffer_base + tid*cm_size;
+        rm_buffer = rm_buffer_base + tid*fullsize;
+        
         /* ================================================================================== */
-        /* loop over each column: read and uncompress the bytes */
+        /* Main loop over all the tiles */
         /* ================================================================================== */
-        ntile++;
-        rmajor_colstart[0] = 0;
-        cmajor_colstart[0] = 0;
-        for (ii = 0; ii < ncols; ii++) {
+        #pragma omp for schedule(dynamic)
+        for (i = 0; i < nchunks; i++) {
+                if (*status > 0) continue;
 
-	    cmajor_repeat[ii] = rmajor_repeat[ii] * rowspertile;
+            /* ================================================================================== */
+            /* loop over each column: read and uncompress the bytes */
+            /* ================================================================================== */
+            ntile = i + 1;
+            datapos = datastart + i * rowspertile * naxis1;
+            if (ntile == nchunks) rowspertile = (long) (rowstotal - (nchunks - 1) * rowspertile);
 
-	    /* starting offset of each field in the column-major table */
-            if (coltype[ii] > 0) {  /* normal fixed length column */
-	          cmajor_colstart[ii + 1] = cmajor_colstart[ii] + rmajor_colwidth[ii] * rowspertile;
-	    } else { /* VLA column: reserve space for the 2nd set of Q pointers */
-	          cmajor_colstart[ii + 1] = cmajor_colstart[ii] + (rmajor_colwidth[ii] + 16) * rowspertile;
-	    }
-	    /* length of each sequence of bytes, after sorting them in signicant order */
-	    cmajor_bytespan[ii] = (rmajor_repeat[ii] * rowspertile);
+            rmajor_colstart[0] = 0;
+            cmajor_colstart[0] = 0;
+            for (ii = 0; ii < ncols; ii++) {
 
-	    /* starting offset of each field in the  row-major table */
-	    rmajor_colstart[ii + 1] = rmajor_colstart[ii] + rmajor_colwidth[ii];
+                cmajor_repeat[ii] = rmajor_repeat[ii] * rowspertile;
 
-            if (rmajor_repeat[ii] > 0) { /* ignore columns with 0 elements */
-	
-	        /* read compressed bytes from input table */
-	        fits_read_descript(infptr, ii + 1, ntile, &vla_repeat, &vla_address, status);
-	
-	        /* allocate memory and read in the compressed bytes */
-	        ptr = malloc(vla_repeat);
-	        if (!ptr) {
-                   ffpmsg("Could not allocate buffer for uncompressed bytes");
-                   *status = MEMORY_ALLOCATION;
-                   free(rm_buffer);  free(cm_buffer);
-                   return(*status);
-	        }
+                /* starting offset of each field in the column-major table */
+                if (coltype[ii] > 0) {  /* normal fixed length column */
+                    cmajor_colstart[ii + 1] = cmajor_colstart[ii] + rmajor_colwidth[ii] * rowspertile;
+                } else { /* VLA column: reserve space for the 2nd set of Q pointers */
+                    cmajor_colstart[ii + 1] = cmajor_colstart[ii] + (rmajor_colwidth[ii] + 16) * rowspertile;
+                }
+                /* length of each sequence of bytes, after sorting them in signicant order */
+                /* cmajor_bytespan[ii] = (rmajor_repeat[ii] * rowspertile); */
 
-	        fits_set_tscale(infptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
-	        fits_read_col_byt(infptr, ii + 1, ntile, 1, vla_repeat, 0, (unsigned char *) ptr, &anynull, status);
-                cptr = cm_buffer + cmajor_colstart[ii];
-	
-		/* size in bytes of the uncompressed column of bytes */
-	        fullsize = (size_t) (cmajor_colstart[ii+1] - cmajor_colstart[ii]);
+                /* starting offset of each field in the  row-major table */
+                rmajor_colstart[ii + 1] = rmajor_colstart[ii] + rmajor_colwidth[ii];
 
-	        switch (colcode[ii]) {
+                if (rmajor_repeat[ii] > 0) { /* ignore columns with 0 elements */
+            
+                    /* read compressed bytes from input table */
+                    #pragma omp critical (read_file)
+                        fits_read_descript(infptr, ii + 1, ntile, &vla_repeat, &vla_address, status);
+            
+                    /* allocate memory and read in the compressed bytes */
+                    ptr = malloc(vla_repeat);
+                    if (!ptr) {
+                        ffpmsg("Could not allocate buffer for uncompressed bytes");
+                        #pragma omp critical (set_status)
+                            *status = MEMORY_ALLOCATION;
+                        /* free(rm_buffer);  free(cm_buffer); */
+                        /* return(*status); */
+                        continue;
+                    }
+                    #pragma omp critical (read_file)
+                    {
+                        fits_set_tscale(infptr, ii + 1, 1.0, 0.0, status);  /* turn off any data scaling, first */
+                        fits_read_col_byt(infptr, ii + 1, ntile, 1, vla_repeat, 0, (unsigned char *) ptr, &anynull, status);
+                    }
+                    cptr = cm_buffer + cmajor_colstart[ii];
+            
+                    /* size in bytes of the uncompressed column of bytes */
+                    fullsize = (size_t) (cmajor_colstart[ii+1] - cmajor_colstart[ii]);
 
-	        case 'I':
+                    switch (colcode[ii]) {
 
-	          if (zctype[ii] == RICE_1) {
-   	             dlen = fits_rdecomp_short((unsigned char *)ptr, vla_repeat, (unsigned short *)cptr, 
-		       fullsize / 2, 32);
-#if BYTESWAPPED
-                     ffswap2((short *) cptr, fullsize / 2); 
-#endif
-	          } else { /* gunzip the data into the correct location */
-	             uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
-	          }
-	          break;
+                    case 'I':
 
-	        case 'J':
+                        if (zctype[ii] == RICE_1) {
+                            dlen = fits_rdecomp_short((unsigned char *)ptr, vla_repeat, (unsigned short *)cptr, 
+                        fullsize / 2, 32);
+                            #if BYTESWAPPED
+                            ffswap2((short *) cptr, fullsize / 2); 
+                            #endif
+                        } else { /* gunzip the data into the correct location */
+                            uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
+                        }
+                        break;
 
-	          if (zctype[ii] == RICE_1) {
-   	              dlen = fits_rdecomp ((unsigned char *) ptr, vla_repeat, (unsigned int *)cptr, 
-		        fullsize / 4, 32);
-#if BYTESWAPPED
-                      ffswap4((int *) cptr,  fullsize / 4); 
-#endif
-	          } else { /* gunzip the data into the correct location */
-	             uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
-	          }
-	          break;
+                    case 'J':
 
-	        case 'B':
+                        if (zctype[ii] == RICE_1) {
+                            dlen = fits_rdecomp ((unsigned char *) ptr, vla_repeat, (unsigned int *)cptr, 
+                            fullsize / 4, 32);
+                            #if BYTESWAPPED
+                            ffswap4((int *) cptr,  fullsize / 4); 
+                            #endif
+                        } else { /* gunzip the data into the correct location */
+                            uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
+                        }
+                        break;
 
-	          if (zctype[ii] == RICE_1) {
-   	              dlen = fits_rdecomp_byte ((unsigned char *) ptr, vla_repeat, (unsigned char *)cptr, 
-		        fullsize, 32);
-	          } else { /* gunzip the data into the correct location */
-	             uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
-	          }
-	          break;
+                    case 'B':
 
-	        default: 
-		  /* all variable length array columns are included in this case */
-	          /* gunzip the data into the correct location in the full table buffer */
-	          uncompress2mem_from_mem(ptr, vla_repeat,
-	              &cptr,  &fullsize, realloc, &dlen, status);              
+                        if (zctype[ii] == RICE_1) {
+                            dlen = fits_rdecomp_byte ((unsigned char *) ptr, vla_repeat, (unsigned char *)cptr, 
+                            fullsize, 32);
+                        } else { /* gunzip the data into the correct location */
+                            uncompress2mem_from_mem(ptr, vla_repeat, &cptr, &fullsize, realloc, &dlen, status);        
+                        }
+                        break;
 
-	        } /* end of switch block */
+                    default: 
+                        /* all variable length array columns are included in this case */
+                        /* gunzip the data into the correct location in the full table buffer */
+                        uncompress2mem_from_mem(ptr, vla_repeat,
+                            &cptr,  &fullsize, realloc, &dlen, status);              
 
-	        free(ptr);
-	  }  /* end of rmajor_repeat > 0 */
-      }  /* end of loop over columns */
-      
-      /* now transpose the rows and columns (from cm_buffer to rm_buffer) */
-      /* move each byte, in turn, from the cm_buffer to the appropriate place in the rm_buffer */
-      for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
-	 ptr = (char *) (cm_buffer + cmajor_colstart[ii]);  /* initialize ptr to start of the column in the cm_buffer */
-         if (rmajor_repeat[ii] > 0) {  /* skip columns with zero elements */
-             if (coltype[ii] > 0) {  /* normal fixed length array columns */
-                 if (zctype[ii] == GZIP_2) {  /*  need to unshuffle the bytes */
+                    } /* end of switch block */
 
-	             /* recombine the byte planes for the 2-byte, 4-byte, and 8-byte numeric columns */
-	             switch (colcode[ii]) {
-	
-		     case 'I':
-		         /* get the 1st byte of each I*2 value */
-	                 for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		             cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
-		             for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		                 *cptr = *ptr;  /* copy 1 byte */
-		                 ptr++;
-		                 cptr += 2;  
-			     }
-			 }
-		         /* get the 2nd byte of each I*2 value */
-	                 for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		            cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
-		            for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		                *cptr = *ptr;  /* copy 1 byte */
-		                ptr++;
-		                cptr += 2;  
-		            }
-		         }
-		         break;
+                    free(ptr);
+                }  /* end of rmajor_repeat > 0 */
+            }  /* end of loop over columns */
+        
+            /* now transpose the rows and columns (from cm_buffer to rm_buffer) */
+            /* move each byte, in turn, from the cm_buffer to the appropriate place in the rm_buffer */
+            for (ii = 0; ii < ncols; ii++) {  /* loop over columns */
+                ptr = (char *) (cm_buffer + cmajor_colstart[ii]);  /* initialize ptr to start of the column in the cm_buffer */
+                if (rmajor_repeat[ii] > 0) {  /* skip columns with zero elements */
+                    if (coltype[ii] > 0) {  /* normal fixed length array columns */
+                        if (zctype[ii] == GZIP_2) {  /*  need to unshuffle the bytes */
 
-		   case 'J':
-		   case 'E':
-		       /* get the 1st byte of each 4-byte value */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 4;  
-		         }
-		       }
-		       /* get the 2nd byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
-		          for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		            *cptr = *ptr;  /* copy 1 byte */
-		            ptr++;
-		            cptr += 4;  
-		          }
-		       }
-		       /* get the 3rd byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 2);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 4;  
-		         }
-		       }
-		       /* get the 4th byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 3);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 4;  
-		         }
-		       }
-		       break;
+                            /* recombine the byte planes for the 2-byte, 4-byte, and 8-byte numeric columns */
+                            switch (colcode[ii]) {
+            
+                            case 'I':
+                                /* get the 1st byte of each I*2 value */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 2;  
+                                    }
+                                }
+                                /* get the 2nd byte of each I*2 value */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 2;  
+                                    }
+                                }
+                                break;
 
-		 case 'D':
-		 case 'K':
-		       /* get the 1st byte of each 8-byte value */
- 	              for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 2nd byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 3rd byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 2);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 4th byte  */
-	  	       for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 3);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 5th byte */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 4);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 6th byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 5);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 7th byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 6);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       /* get the 8th byte  */
-	               for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		         cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 7);  
-		         for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
-		           *cptr = *ptr;  /* copy 1 byte */
-		           ptr++;
-		           cptr += 8;  
-		         }
-		       }
-		       break;
+                            case 'J':
+                            case 'E':
+                                /* get the 1st byte of each 4-byte value */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
+                                        for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 4;  
+                                    }
+                                }
+                                /* get the 2nd byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 4;  
+                                    }
+                                }
+                                /* get the 3rd byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 2);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 4;  
+                                    }
+                                }
+                                /* get the 4th byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 3);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 4;  
+                                    }
+                                }
+                                break;
 
-		default: /*  should never get here */
-	            ffpmsg("Error: unexpected attempt to use GZIP_2 to compress a column unsuitable data type");
-		    *status = DATA_DECOMPRESSION_ERR;
-                    free(rm_buffer);  free(cm_buffer);
-	            return(*status);
+                            case 'D':
+                            case 'K':
+                                /* get the 1st byte of each 8-byte value */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]));  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 2nd byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 1);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 3rd byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 2);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 4th byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 3);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 5th byte */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 4);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 6th byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 5);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 7th byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 6);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                /* get the 8th byte  */
+                                for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                    cptr = rm_buffer + (rmajor_colstart[ii] + (jj * rmajor_colstart[ncols]) + 7);  
+                                    for (kk = 0; kk < rmajor_repeat[ii]; kk++) {
+                                        *cptr = *ptr;  /* copy 1 byte */
+                                        ptr++;
+                                        cptr += 8;  
+                                    }
+                                }
+                                break;
 
-	        }  /* end of switch  for shuffling the bytes*/
+                            default: /*  should never get here */
+                                ffpmsg("Error: unexpected attempt to use GZIP_2 to compress a column unsuitable data type");
+                                #pragma omp critical (set_status)
+                                    *status = DATA_DECOMPRESSION_ERR;
+                                /*    free(rm_buffer);  free(cm_buffer); */
+                                /* return(*status); */
+                                continue;
 
-            } else {  /* not GZIP_2, don't have to shuffle bytes, so just transpose the rows and columns */
+                            }  /* end of switch  for shuffling the bytes*/
 
-	         for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
-		     cptr = rm_buffer + (rmajor_colstart[ii] + jj * rmajor_colstart[ncols]);   /* addr to copy to */
-		     memcpy(cptr, ptr, (size_t) rmajor_colwidth[ii]);
-	 
-		     ptr += (rmajor_colwidth[ii]);
-		 }
-	    }
-        } else {  /* transpose the variable length array pointers */
+                        } else {  /* not GZIP_2, don't have to shuffle bytes, so just transpose the rows and columns */
 
-              for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output uncompressed table */
-	        cptr = rm_buffer + (rmajor_colstart[ii] + jj * rmajor_colstart[ncols]);   /* addr to copy to */
-	        memcpy(cptr, ptr, (size_t) rmajor_colwidth[ii]);
-	 
-	        ptr += (rmajor_colwidth[ii]);
-	      }
+                            for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output table */
+                                cptr = rm_buffer + (rmajor_colstart[ii] + jj * rmajor_colstart[ncols]);   /* addr to copy to */
+                                memcpy(cptr, ptr, (size_t) rmajor_colwidth[ii]);
+                        
+                                ptr += (rmajor_colwidth[ii]);
+                            }
+                        }
+                    } else {  /* transpose the variable length array pointers */
 
-	      if (rmajor_colwidth[ii] == 8 ) {  /* these are P-type descriptors */
-	           pdescript = (int *) (cm_buffer + cmajor_colstart[ii]);
-#if BYTESWAPPED
-	           ffswap4((int *) pdescript,  rowspertile * 2);  /* byte-swap the descriptor */
-#endif
-	      } else if (rmajor_colwidth[ii] == 16 ) {  /* these are Q-type descriptors */
-	           qdescript = (LONGLONG *) (cm_buffer + cmajor_colstart[ii]);
-#if BYTESWAPPED
-	           ffswap8((double *) qdescript,  rowspertile * 2); /* byte-swap the descriptor */
-#endif
-	      } else { /* this should never happen */
-	            ffpmsg("Error: Descriptor column is neither 8 nor 16 bytes wide");
-                    free(rm_buffer);  free(cm_buffer);
-		    *status = DATA_DECOMPRESSION_ERR;
-	            return(*status);
-	      }	
-	      	
-	      /* First, set pointer to the Q descriptors, and byte-swap them, if needed */
-	      descript = (LONGLONG*) (cm_buffer + cmajor_colstart[ii] + (rmajor_colwidth[ii] * rowspertile));
-#if BYTESWAPPED
-	      /* byte-swap the descriptor */
-	      ffswap8((double *) descript,  rowspertile * 2);
-#endif
+                        for (jj = 0; jj < rowspertile; jj++) {  /* loop over number of rows in the output uncompressed table */
+                            cptr = rm_buffer + (rmajor_colstart[ii] + jj * rmajor_colstart[ncols]);   /* addr to copy to */
+                            memcpy(cptr, ptr, (size_t) rmajor_colwidth[ii]);
+                    
+                            ptr += (rmajor_colwidth[ii]);
+                        }
 
-	      /* now uncompress all the individual VLAs, and */
-	      /* write them to their original location in the uncompressed file */
+                        if (rmajor_colwidth[ii] == 8 ) {  /* these are P-type descriptors */
+                            pdescript = (int *) (cm_buffer + cmajor_colstart[ii]);
+                            #if BYTESWAPPED
+                            ffswap4((int *) pdescript,  rowspertile * 2);  /* byte-swap the descriptor */
+                            #endif
+                        } else if (rmajor_colwidth[ii] == 16 ) {  /* these are Q-type descriptors */
+                            qdescript = (LONGLONG *) (cm_buffer + cmajor_colstart[ii]);
+                            #if BYTESWAPPED
+                            ffswap8((double *) qdescript,  rowspertile * 2); /* byte-swap the descriptor */
+                            #endif
+                        } else { /* this should never happen */
+                            ffpmsg("Error: Descriptor column is neither 8 nor 16 bytes wide");
+                            /* free(rm_buffer);  free(cm_buffer); */
+                            #pragma omp critical (set_status)
+                                *status = DATA_DECOMPRESSION_ERR;
+                            /* return(*status); */
+                            continue;
+                        }	
+                
+                        /* First, set pointer to the Q descriptors, and byte-swap them, if needed */
+                        descript = (LONGLONG*) (cm_buffer + cmajor_colstart[ii] + (rmajor_colwidth[ii] * rowspertile));
+                        #if BYTESWAPPED
+                        /* byte-swap the descriptor */
+                        ffswap8((double *) descript,  rowspertile * 2);
+                        #endif
 
-	      for (jj = 0; jj < rowspertile; jj++)   {    /* loop over rows */
-                    /* get the size and location of the compressed VLA in the compressed table */
-		    cvlalen = descript[jj * 2];
-		    cvlastart = descript[(jj * 2) + 1]; 
-		    if (cvlalen > 0 ) {
+                        /* now uncompress all the individual VLAs, and */
+                        /* write them to their original location in the uncompressed file */
 
-			/* get the size and location to write the uncompressed VLA in the uncompressed table */
-			if (rmajor_colwidth[ii] == 8 ) { 
-			    vlalen = pdescript[jj * 2];
-			    vlastart = pdescript[(jj * 2) + 1];
-			} else  {
-			    vlalen = qdescript[jj * 2];
-			    vlastart = qdescript[(jj * 2) + 1];
-			}			
-			vlamemlen = (size_t) (vlalen * (-coltype[ii] / 10));  /* size of the uncompressed VLA, in bytes */
+                        for (jj = 0; jj < rowspertile; jj++) {    /* loop over rows */
+                            /* get the size and location of the compressed VLA in the compressed table */
+                            cvlalen = descript[jj * 2];
+                            cvlastart = descript[(jj * 2) + 1]; 
+                            if (cvlalen > 0 ) {
 
-			/* allocate memory for the compressed vla */
-			compressed_vla = malloc( (size_t) cvlalen);
-			if (!compressed_vla) {
-			    ffpmsg("Could not allocate buffer for compressed VLA");
-			    free(rm_buffer);  free(cm_buffer);
-			    *status = MEMORY_ALLOCATION;
-			    return(*status);
-			}
+                                /* get the size and location to write the uncompressed VLA in the uncompressed table */
+                                if (rmajor_colwidth[ii] == 8 ) { 
+                                    vlalen = pdescript[jj * 2];
+                                    vlastart = pdescript[(jj * 2) + 1];
+                                } else {
+                                    vlalen = qdescript[jj * 2];
+                                    vlastart = qdescript[(jj * 2) + 1];
+                                }			
+                                vlamemlen = (size_t) (vlalen * (-coltype[ii] / 10));  /* size of the uncompressed VLA, in bytes */
 
-			/* read the compressed VLA from the heap in the input compressed table */
-			bytepos = (size_t) ((infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + cvlastart);
-			ffmbyt(infptr, bytepos, REPORT_EOF, status);
-			ffgbyt(infptr, cvlalen, compressed_vla, status);  /* read the bytes */
-			/* if the VLA couldn't be compressed, just copy it directly to the output uncompressed table */
-			if (cvlalen   == vlamemlen ) {
-			    bytepos = (size_t) ((outfptr->Fptr)->datastart + (outfptr->Fptr)->heapstart + vlastart);
-			    ffmbyt(outfptr, bytepos, IGNORE_EOF, status);
-			    ffpbyt(outfptr, cvlalen, compressed_vla, status);  /* write the bytes */
-			} else {  /* uncompress the VLA  */
-		  
-			    /* allocate memory for the uncompressed VLA */
-			    uncompressed_vla =  malloc(vlamemlen);
-			    if (!uncompressed_vla) {
-				ffpmsg("Could not allocate buffer for uncompressed VLA");
-				*status = MEMORY_ALLOCATION;
-			        free(compressed_vla); free(rm_buffer);  free(cm_buffer);
-				return(*status);
-			    }
-			    /* uncompress the VLA with the appropriate algorithm */
-			    if (zctype[ii] == RICE_1) {
+                                /* allocate memory for the compressed vla */
+                                compressed_vla = malloc( (size_t) cvlalen);
+                                if (!compressed_vla) {
+                                    ffpmsg("Could not allocate buffer for compressed VLA");
+                                    /* free(rm_buffer);  free(cm_buffer); */
+                                    #pragma omp critical (set_status)
+                                        *status = MEMORY_ALLOCATION;
+                                    /*return(*status); */
+                                    continue;
+                                }
 
-				if (-coltype[ii] == TSHORT) {
-				    dlen = fits_rdecomp_short((unsigned char *) compressed_vla, (int) cvlalen, (unsigned short *)uncompressed_vla, 
-					(int) vlalen, 32);
-#if BYTESWAPPED
-				   ffswap2((short *) uncompressed_vla, (long) vlalen); 
-#endif
-				} else if (-coltype[ii] == TLONG) {
-				    dlen = fits_rdecomp((unsigned char *) compressed_vla, (int) cvlalen, (unsigned int *)uncompressed_vla, 
-					(int) vlalen, 32);
-#if BYTESWAPPED
-				   ffswap4((int *) uncompressed_vla, (long) vlalen); 
-#endif
- 				} else if (-coltype[ii] == TBYTE) {
-				    dlen = fits_rdecomp_byte((unsigned char *) compressed_vla, (int) cvlalen, (unsigned char *) uncompressed_vla, 
-					(int) vlalen, 32);
-				} else {
-				    /* this should not happen */
-				    ffpmsg(" Error: cannot uncompress this column type with the RICE algorithm");
+                                /* read the compressed VLA from the heap in the input compressed table */
+                                #pragma omp critical (read_file)
+                                {
+                                    bytepos = (size_t) ((infptr->Fptr)->datastart + (infptr->Fptr)->heapstart + cvlastart);
+                                    ffmbyt(infptr, bytepos, REPORT_EOF, status);
+                                    ffgbyt(infptr, cvlalen, compressed_vla, status);  /* read the bytes */
+                                }
+                                
+                                /* if the VLA couldn't be compressed, just copy it directly to the output uncompressed table */
+                                if (cvlalen == vlamemlen) {
+                                    #pragma omp critical (write_file)
+                                    {
+                                        bytepos = (size_t) ((outfptr->Fptr)->datastart + (outfptr->Fptr)->heapstart + vlastart);
+                                        ffmbyt(outfptr, bytepos, IGNORE_EOF, status);
+                                        ffpbyt(outfptr, cvlalen, compressed_vla, status);  /* write the bytes */
+                                    }
+                                } else {  /* uncompress the VLA  */
+                            
+                                    /* allocate memory for the uncompressed VLA */
+                                    uncompressed_vla =  malloc(vlamemlen);
+                                    if (!uncompressed_vla) {
+                                        ffpmsg("Could not allocate buffer for uncompressed VLA");
+                                        #pragma omp critical (set_status)
+                                            *status = MEMORY_ALLOCATION;
+                                        free(compressed_vla); /* free(rm_buffer);  free(cm_buffer); */
+                                        /* return(*status); */
+                                        continue;
+                                    }
+                                    /* uncompress the VLA with the appropriate algorithm */
+                                    if (zctype[ii] == RICE_1) {
 
-				    *status = DATA_DECOMPRESSION_ERR;
-			            free(uncompressed_vla); free(compressed_vla); free(rm_buffer);  free(cm_buffer);
-				    return(*status);
-				}  
+                                        if (-coltype[ii] == TSHORT) {
+                                            dlen = fits_rdecomp_short((unsigned char *) compressed_vla, (int) cvlalen, (unsigned short *)uncompressed_vla, 
+                                            (int) vlalen, 32);
+                                            #if BYTESWAPPED
+                                            ffswap2((short *) uncompressed_vla, (long) vlalen); 
+                                            #endif
+                                        } else if (-coltype[ii] == TLONG) {
+                                            dlen = fits_rdecomp((unsigned char *) compressed_vla, (int) cvlalen, (unsigned int *)uncompressed_vla, 
+                                            (int) vlalen, 32);
+                                            #if BYTESWAPPED
+                                            ffswap4((int *) uncompressed_vla, (long) vlalen); 
+                                            #endif
+                                        } else if (-coltype[ii] == TBYTE) {
+                                            dlen = fits_rdecomp_byte((unsigned char *) compressed_vla, (int) cvlalen, (unsigned char *) uncompressed_vla, 
+                                            (int) vlalen, 32);
+                                        } else {
+                                            /* this should not happen */
+                                            ffpmsg(" Error: cannot uncompress this column type with the RICE algorithm");
+                                            #pragma omp critical (set_status)
+                                                *status = DATA_DECOMPRESSION_ERR;
+                                            free(uncompressed_vla); free(compressed_vla); /* free(rm_buffer);  free(cm_buffer); */
+                                            /* return(*status); */
+                                            continue;
+                                        }  
 
-			    } else if (zctype[ii] == GZIP_1 || zctype[ii] == GZIP_2){  
+                                    } else if (zctype[ii] == GZIP_1 || zctype[ii] == GZIP_2) {  
 
-			       /*: gzip uncompress the array of bytes */
-			       uncompress2mem_from_mem( compressed_vla, (size_t) cvlalen, &uncompressed_vla, &vlamemlen, realloc, &vlamemlen, status);
+                                        /*: gzip uncompress the array of bytes */
+                                        uncompress2mem_from_mem( compressed_vla, (size_t) cvlalen, &uncompressed_vla, &vlamemlen, realloc, &vlamemlen, status);
 
-			       if (zctype[ii] == GZIP_2 ) {
-				  /* unshuffle the bytes after ungzipping them */
-				  if ( (int) (-coltype[ii] / 10) == 2) {
-				    fits_unshuffle_2bytes((char *) uncompressed_vla, vlalen, status);
-				  } else if ( (int) (-coltype[ii] / 10) == 4) {
-				    fits_unshuffle_4bytes((char *) uncompressed_vla, vlalen, status);
-				  } else if ( (int) (-coltype[ii] / 10) == 8) {
-				    fits_unshuffle_8bytes((char *) uncompressed_vla, vlalen, status);
-				  }
-			       }
+                                        if (zctype[ii] == GZIP_2 ) {
+                                            /* unshuffle the bytes after ungzipping them */
+                                            if ( (int) (-coltype[ii] / 10) == 2) {
+                                                fits_unshuffle_2bytes((char *) uncompressed_vla, vlalen, status);
+                                            } else if ( (int) (-coltype[ii] / 10) == 4) {
+                                                fits_unshuffle_4bytes((char *) uncompressed_vla, vlalen, status);
+                                            } else if ( (int) (-coltype[ii] / 10) == 8) {
+                                                fits_unshuffle_8bytes((char *) uncompressed_vla, vlalen, status);
+                                            }
+                                        }
 
-			    } else {
-				/* this should not happen */
-				ffpmsg(" Error: unknown compression algorithm");
-			        free(uncompressed_vla); free(compressed_vla); free(rm_buffer);  free(cm_buffer);
-				*status = DATA_COMPRESSION_ERR;
-				return(*status);
-			    }  		     
+                                    } else {
+                                        /* this should not happen */
+                                        ffpmsg(" Error: unknown compression algorithm");
+                                        free(uncompressed_vla); free(compressed_vla); /* free(rm_buffer);  free(cm_buffer); */
+                                        #pragma omp critical (set_status)
+                                            *status = DATA_COMPRESSION_ERR;
+                                        /* return(*status); */
+                                        continue;
+                                    }  		     
+                                    #pragma omp critical (write_file)
+                                    {
+                                        bytepos = (size_t) ((outfptr->Fptr)->datastart + (outfptr->Fptr)->heapstart + vlastart);
+                                        ffmbyt(outfptr, bytepos, IGNORE_EOF, status);
+                                        ffpbyt(outfptr, vlamemlen, uncompressed_vla, status);  /* write the bytes */
+                                    }
+                                    free(uncompressed_vla);
+                                }  /* end of uncompress VLA */
 
-			    bytepos = (size_t) ((outfptr->Fptr)->datastart + (outfptr->Fptr)->heapstart + vlastart);
-			    ffmbyt(outfptr, bytepos, IGNORE_EOF, status);
-			    ffpbyt(outfptr, vlamemlen, uncompressed_vla, status);  /* write the bytes */
-			    
-			     free(uncompressed_vla);
-			}  /* end of uncompress VLA */
+                                free(compressed_vla);
 
-		        free(compressed_vla);
+                            } /* end of vlalen > 0 */
+                        } /* end of loop over rowspertile */
 
-		  } /* end of vlalen > 0 */
-		} /* end of loop over rowspertile */
+                    } /* end of variable length array section*/
+                }  /* end of if column repeat > 0 */
+            }  /* end of ncols loop */
 
-              } /* end of variable length array section*/
-           }  /* end of if column repeat > 0 */
-        }  /* end of ncols loop */
+            /* copy the buffer of data to the output data unit */    
+            #pragma omp critical (write_file)
+            {
+                ffmbyt(outfptr, datapos, 1, status);
+                ffpbyt(outfptr, naxis1 * rowspertile, rm_buffer, status);
+            }  
+            
 
-        /* copy the buffer of data to the output data unit */
+            /* increment pointers for next tile */
+            /* rowstart += rowspertile; */
+            /* rowstotal -= rowspertile; */
+            /* datastart += (naxis1 * rowspertile); */
 
-        if (datastart == 0) fits_get_hduaddrll(outfptr, &headstart, &datastart, &dataend, status);        
+        }  /* end of while rows still remain */
 
-        ffmbyt(outfptr, datastart, 1, status);
-        ffpbyt(outfptr, naxis1 * rowspertile, rm_buffer, status);
-
-	/* increment pointers for next tile */
-	rowstart += rowspertile;
-        rowsremain -= rowspertile;
-	datastart += (naxis1 * rowspertile);
-	if (rowspertile > rowsremain) rowspertile = (long) rowsremain;
-
-    }  /* end of while rows still remain */
-
-    free(rm_buffer);
-    free(cm_buffer);
-	
+    }
+    free(rm_buffer_base);
+    free(cm_buffer_base);
     /* reset internal table structure parameters */
     fits_set_hdustruc(outfptr, status);
     return(*status);

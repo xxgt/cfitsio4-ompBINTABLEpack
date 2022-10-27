@@ -2055,8 +2055,8 @@ int CFITS_API fits_hdecompress(unsigned char *input, int smooth, int *a, int *nx
 int CFITS_API fits_hdecompress64(unsigned char *input, int smooth, LONGLONG *a, int *nx, 
        int *ny, int *scale, int *status);
 
-int CFITS_API fits_compress_table  (fitsfile *infptr, fitsfile *outfptr, int *status);
-int CFITS_API fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int *status);
+int CFITS_API fits_compress_table  (fitsfile *infptr, fitsfile *outfptr, int num_worker, int *status);
+int CFITS_API fits_uncompress_table(fitsfile *infptr, fitsfile *outfptr, int num_worker, int *status);
 
 /* curl library wrapper routines (for https access) */
 int CFITS_API fits_init_https(void);

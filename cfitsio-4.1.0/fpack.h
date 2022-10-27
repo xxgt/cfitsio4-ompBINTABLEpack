@@ -118,6 +118,7 @@ typedef struct
 	int     do_tables;  
 	int	test_all;
 	int	verbose;
+  int num_workers;
 
 	char	prefix[SZ_STR];
 	char	extname[SZ_STR];

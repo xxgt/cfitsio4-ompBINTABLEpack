@@ -8,6 +8,7 @@
 /* #include <signal.h> */
 #include "fitsio.h"
 #include "fpack.h"
+#include <omp.h>
 
 /* ================================================================== */
 int main(int argc, char *argv[])
@@ -50,7 +51,8 @@ int fp_get_param (int argc, char *argv[], fpstate *fpptr)
 	        !strncmp(argv[iarg], "-g1", 3) || !strncmp(argv[iarg], "-g2", 3) ||
 	        !strncmp(argv[iarg], "-i2f", 4) ||
 	        !strncmp(argv[iarg], "-n3ratio", 8) || !strncmp(argv[iarg], "-n3min", 6) ||
-	        !strncmp(argv[iarg], "-tableonly", 10) || !strncmp(argv[iarg], "-table", 6) )  
+	        !strncmp(argv[iarg], "-tableonly", 10) || !strncmp(argv[iarg], "-table", 6) ||
+			!strncmp(argv[iarg], "-threads", 8))  
 	    {
 
 		/* Rice is the default, so -r is superfluous  */
@@ -206,6 +208,15 @@ int fp_get_param (int argc, char *argv[], fpstate *fpptr)
 		    fprintf(stderr, " However users should be aware that the compressed table files may\n");
 		    fprintf(stderr, " only be readable by a limited number of applications (including fpack).\n");
 
+		} else if (!strcmp(argv[iarg], "-threads")) {
+		    if (++iarg >= argc) {
+			fp_usage (); exit (-1);
+		    } else {
+			fpptr->num_workers = (int) atoi(argv[iarg]);
+			if (fpptr->num_workers == 0) {
+				fp_usage (); exit (-1);
+			}
+		    }
 		} else if (argv[iarg][1] == 't') {
 		    if (gottile) {
 			fp_msg ("Error: multiple tile specifications\n");
@@ -360,7 +371,7 @@ int fp_usage (void)
 {
 fp_msg ("usage: fpack ");
 fp_msg (
-"[-r|-h|-g|-p] [-w|-t <axes>] [-q <level>] [-s <scale>] [-n <noise>] -v <FITS>\n");
+"[-r|-h|-g|-p] [-w|-t <axes>] [-q <level>] [-s <scale>] [-n <noise>] [-threads <num>] -v <FITS>\n");
 fp_msg ("more:   [-T] [-R] [-F] [-D] [-Y] [-O <file>] [-S] [-L] [-C] [-H] [-V] [-i2f]\n");
 return(0);
 }
@@ -429,6 +440,7 @@ fp_msg (" -T          Show compression algorithm comparison test statistics; fil
 fp_msg (" -R <file>   Write the comparison test report (above) to a text file.\n");
 fp_msg (" -table      Compress FITS binary tables as well as compress any image HDUs.\n");
 fp_msg (" -tableonly  Compress only FITS binary tables; do not compress any image HDUs.\n");
+fp_msg (" -threads <num> Set the amount of threads.\n");
 fp_msg ("             \n");
 
 fp_msg ("\nkeywords shared with funpack:\n");
