@@ -6,6 +6,7 @@
 #include "fitsio.h"
 #include "fpack.h"
 #include <omp.h>
+#include <sys/sysinfo.h>
 
 int main (int argc, char *argv[])
 {
@@ -105,7 +106,7 @@ int fu_get_param (int argc, char *argv[], fpstate *fpptr)
 		    } else {
 			fpptr->num_workers = (int) atoi(argv[iarg]);
 			if (fpptr->num_workers == 0) {
-				fu_usage (); exit (-1);
+				fpptr->num_workers = get_nprocs();
 			}
 		    }
 		} else {
